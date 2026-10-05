@@ -18,6 +18,8 @@ from pathlib import Path
 import pytest
 import yaml
 
+from infx.results.evals import build_row
+
 REPO_ROOT = Path(__file__).resolve().parents[3]
 BENCHMARK_LIB = REPO_ROOT / "benchmarks" / "benchmark_lib.sh"
 MULTINODE_AGENTIC_SCRIPT = REPO_ROOT / "benchmarks/srt_agentic.sh"
@@ -1593,6 +1595,10 @@ def test_summary_preserves_single_node_dp_attention(
     assert meta["disagg"] is False
     assert meta["prefill_num_workers"] == 0
     assert meta["decode_num_workers"] == 0
+    assert meta["num_gpus"] == 8
+    row = build_row(meta, {"task": "gsm8k", "strict": 1.0})
+    assert row["num_gpus"] == 8
+    assert row["ep"] == 8
 
 
 def test_summary_preserves_asymmetric_multinode_dp_attention(tmp_path: Path) -> None:
@@ -1600,7 +1606,7 @@ def test_summary_preserves_asymmetric_multinode_dp_attention(tmp_path: Path) -> 
         tmp_path, IS_MULTINODE="true", DP_ATTENTION="false",
         PREFILL_TP="4", PREFILL_EP="4", DECODE_TP="8", DECODE_EP="8",
         PREFILL_DP_ATTN="true", DECODE_DP_ATTN="false",
-        DISAGG="true", PREFILL_NUM_WORKERS="1", DECODE_NUM_WORKERS="2",
+        DISAGG="true", PREFILL_NUM_WORKERS="1", DECODE_NUM_WORKERS="1",
     )
     assert meta["dp_attention"] is True
     assert meta["prefill_dp_attention"] is True
@@ -1609,7 +1615,14 @@ def test_summary_preserves_asymmetric_multinode_dp_attention(tmp_path: Path) -> 
     assert meta["decode_tp"] == 8
     assert meta["disagg"] is True
     assert meta["prefill_num_workers"] == 1
-    assert meta["decode_num_workers"] == 2
+    assert meta["decode_num_workers"] == 1
+    assert meta["num_prefill_gpu"] == 4
+    assert meta["num_decode_gpu"] == 8
+    assert meta["num_gpus"] == 12
+    row = build_row(meta, {"task": "gsm8k", "strict": 1.0})
+    assert row["num_prefill_gpu"] == 4
+    assert row["num_decode_gpu"] == 8
+    assert row["num_gpus"] == 12
 
 
 def test_summary_stages_bfcl_upstream_archive_before_cleanup(tmp_path: Path) -> None:

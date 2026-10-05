@@ -2315,10 +2315,6 @@ _write_lm_eval_meta_json() {
             *) echo "ERROR: DISAGG must be true or false" >&2; return 1 ;;
         esac
         printf -v disagg_metadata '  "disagg": %s,\n' "$DISAGG"
-        if [ "$DISAGG" = "false" ] && [ "$is_multinode_json" = "false" ]; then
-            prefill_num_workers=0
-            decode_num_workers=0
-        fi
     fi
 
     local dp_json
@@ -2388,6 +2384,19 @@ ${batch_metadata}  "ep": ${EP_SIZE:-1},
   "osl": "${OSL:-0}"
 }
 META
+    if [ -n "$disagg_metadata" ]; then
+        PYTHONPATH="$INFERENCEX_REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 - "$meta_json" <<'PYMETA'
+import json
+import sys
+from pathlib import Path
+from infx.results.evals import eval_topology
+
+path = Path(sys.argv[1])
+metadata = json.loads(path.read_text())
+metadata.update(eval_topology(metadata))
+path.write_text(json.dumps(metadata, indent=2) + "\n")
+PYMETA
+    fi
 }
 
 rewrite_lm_eval_meta_env() {
