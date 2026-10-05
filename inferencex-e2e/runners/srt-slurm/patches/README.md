@@ -9,3 +9,4 @@ Each patch is a temporary fix for an open upstream PR. When the PR merges and th
 | Patch | Upstream PR | Fix |
 |-------|-------------|-----|
 | `548-atom-served-model-name.patch` | [NVIDIA/srt-slurm#548](https://github.com/NVIDIA/srt-slurm/pull/548) | ATOM serves evals the role's `served-model-name` instead of the literal `--model` path, so AToMesh accepts eval requests |
+| `dynamo-install-with-deps.patch` | none (InferenceX-local) | `dynamo_wheels.py install` drops `--no-deps`/`--no-index` so ai-dynamo's own dependencies (e.g. `redis`, imported at worker startup by 1.6.0.dev20260923+) resolve from the package indexes; the staged wheels still satisfy the exact ai-dynamo pins |

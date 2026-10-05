@@ -26,8 +26,9 @@ base:
     #     the attention-DP KV-event hang;
     # (b) parses --publish-metrics (the 1.5.0 release only knows --publish-events-and-metrics and
     #     exits with "Unrecognized argument: --publish-metrics");
-    # Note: 1.6.0.dev20260923+ import redis.asyncio at worker startup (dynamo.common.multimodal), and
-    # srtctl installs the wheel --no-deps, so the container must provide redis.
+    # Note: 1.6.0.dev20260923+ import redis.asyncio at worker startup (dynamo.common.multimodal);
+    # runners/srt-slurm/patches/dynamo-install-with-deps.patch installs the wheel with its
+    # dependencies so redis is present in the container.
     # srtctl advertises the worker leaders' /metrics to AIPerf.
     publish_metrics: true
   roles:
