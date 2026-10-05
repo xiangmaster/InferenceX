@@ -9,3 +9,4 @@ Each patch is a temporary fix for an open upstream PR. When the PR merges and th
 | Patch | Upstream PR | Fix |
 |-------|-------------|-----|
 | `548-atom-served-model-name.patch` | [NVIDIA/srt-slurm#548](https://github.com/NVIDIA/srt-slurm/pull/548) | ATOM serves evals the role's `served-model-name` instead of the literal `--model` path, so AToMesh accepts eval requests |
+| `llm-d-frontend.patch` | [SemiAnalysisAI/srt-slurm#45](https://github.com/SemiAnalysisAI/srt-slurm/pull/45) (stacked on #38) | [DNM] `frontend.type: llm-d` (llm-d Endpoint Picker behind Envoy, with the P/D sidecar on decode workers) for vLLM, plus the `smg` frontend of #38 it builds on |

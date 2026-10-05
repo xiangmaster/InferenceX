@@ -1,0 +1,2650 @@
+diff --git a/docs/architecture.md b/docs/architecture.md
+index 1881493a..8518bb5a 100644
+--- a/docs/architecture.md
++++ b/docs/architecture.md
+@@ -384,10 +384,11 @@ class FrontendProtocol(Protocol):
+     required_backend: str | None  # pairing, checked at config load
+     worker_launch: Literal["dynamo", "direct"]  # backends read this, never the name
+     expands_node_local_dp: bool
+-    metrics_path: str
++    metrics_path: str  # the router's (or direct endpoint's) Prometheus path
+ 
+     def validate(self, config) -> None: ...  # recipe rules (raise ValueError)
+     def worker_api_port(self, mode) -> Literal["public", "allocated"]: ...
++    def worker_metrics_path(self, backend) -> str: ...  # Dynamo /metrics, else backend.native_metrics_path
+     def worker_metrics_port(self, process, runtime) -> int | None: ...
+     def worker_endpoint_port(self, process, config, runtime) -> int | None: ...
+     def profiling_control_port(self, process, config, runtime) -> int | None: ...
+diff --git a/docs/config-reference.md b/docs/config-reference.md
+index db321a70..716b46a0 100644
+--- a/docs/config-reference.md
++++ b/docs/config-reference.md
+@@ -701,7 +701,7 @@ frontend:
+ 
+ | Field                       | Type | Default       | Description                         |
+ | --------------------------- | ---- | ------------- | ----------------------------------- |
+-| `type`                      | str  | dynamo        | `dynamo`; static routers `sglang-router`, `vllm-router`; direct (one aggregate worker binds the public port, no router process) `sglang`, `vllm`, `trtllm_serve` |
++| `type`                      | str  | dynamo        | `dynamo`; static routers `sglang-router`, `vllm-router`, `smg` (any backend, see [SMG](smg.md)); direct (one aggregate worker binds the public port, no router process) `sglang`, `vllm`, `trtllm_serve` |
+ | `placement.node`            | str  | head          | `head`, `first_decode`, or `dedicated`; see [placement](#placement) |
+ | `enable_multiple_frontends` | bool | true          | Scale with nginx + multiple routers |
+ | `num_additional_frontends`  | int  | 9             | Additional routers beyond master    |
+diff --git a/docs/llm-d.md b/docs/llm-d.md
+new file mode 100644
+index 00000000..4d96c81f
+--- /dev/null
++++ b/docs/llm-d.md
+@@ -0,0 +1,162 @@
++# llm-d router
++
++`frontend.type: llm-d` routes requests with the [llm-d](https://llm-d.ai) router: the
++Endpoint Picker (EPP) behind Envoy, in front of direct `vllm serve` workers. The EPP
++scores the workers with the plugins in `frontend.epp_config` (prefix-cache affinity,
++queue depth, load, ...) and, for prefill/decode, picks a prefill and a decode worker for
++every request. No Dynamo, NATS, or etcd is involved.
++
++Upstream references are pinned to llm-d-router
++[v0.11.0](https://github.com/llm-d/llm-d-router/tree/a5cbe600ebade00cf3e9885beaf2bfacddeabce1)
++and the llm-d [no-Kubernetes guide](https://github.com/llm-d/llm-d/tree/7fb84b0adf8e1d41eb2cef105fc1aafaf5a9b64f/guides/no-kubernetes-deployment).
++
++## What runs where
++
++| Process | Where | Launched as | Port |
++| --- | --- | --- | --- |
++| Envoy | router node | the frontend (`llm-d-envoy_0`) | the public port (8000); admin `/ready` on 9901 |
++| EPP | router node | the frontend (`llm-d-epp_0`) | ext_proc gRPC 9002, gRPC health 9003, Prometheus 9090 |
++| P/D sidecar | every routable decode worker (prefill/decode jobs only) | the implied `llm-d-sidecar` service | `Process.proxy_port`, from the allocator |
++| vLLM | every worker | the backend, as for the other static routers | `Process.http_port` |
++
++Envoy owns the public port. For every request it asks the EPP over ext_proc
++(`FULL_DUPLEX_STREAMED`) which endpoint to use; the EPP sets the
++`x-gateway-destination-endpoint` header and Envoy's `ORIGINAL_DST` cluster forwards the
++request there. For prefill/decode the EPP picks a decode endpoint and names the chosen
++prefill worker in `x-prefiller-host-port`
++([`disagg_profile_handler.go`](https://github.com/llm-d/llm-d-router/blob/a5cbe600ebade00cf3e9885beaf2bfacddeabce1/pkg/epp/framework/plugins/scheduling/profilehandler/disagg/disagg_profile_handler.go#L533-L536)).
++The decode endpoint is llm-d's P/D sidecar: it sends the request to that prefill worker
++first, then hands the returned `kv_transfer_params` to its own vLLM, whose KV connector
++pulls the cache from the prefill worker
++([`connector_nixlv2.go`](https://github.com/llm-d/llm-d-router/blob/a5cbe600ebade00cf3e9885beaf2bfacddeabce1/pkg/sidecar/proxy/connector_nixlv2.go#L42)).
++Everything else, `/metrics` included, the sidecar proxies to its vLLM.
++
++### Why the EPP and Envoy are the frontend and the sidecar is a service
++
++The frontend is the process that owns the public port and decides when the job is
++ready, so Envoy and the EPP are the frontend. They also have to start at the frontend's
++moment: llm-d discovers workers through Kubernetes or a file, and the workers here are
++plain engines that register nowhere, so srtctl is the registrar. It writes the endpoints
++file once every worker answers `/health` (the static routers' pre-start gate), then starts
++the EPP and Envoy; no service phase sits between the workers and the frontend.
++
++The sidecar is a different process with its own image, placement, and health check, one
++per decode worker, on the worker's node; that is what `services` with
++`placement.per: worker` is for. Its `GET /health` answers 200 on its own
++([`proxy.go`](https://github.com/llm-d/llm-d-router/blob/a5cbe600ebade00cf3e9885beaf2bfacddeabce1/pkg/sidecar/proxy/proxy.go#L586-L588)),
++so it starts in the `before_workers` phase and gates on that probe. It is critical: a
++dead sidecar takes its decode worker out of the routing pool. The frontend implies it,
++as Dynamo implies etcd; declare a service named `llm-d-sidecar` to change it:
++
++```yaml
++services:
++  - name: llm-d-sidecar
++    type: llm-d-sidecar
++    container: my-llm-d-image            # default: frontend.container_image, else the job container
++    args:
++      - --enable-prefiller-sampling      # appended after the flags srtctl sets
++```
++
++srtctl sets `--port` (the worker's `Process.proxy_port`), `--model-server-port` (its
++`Process.http_port`), `--kv-connector`, and `--secure-proxy=false`; `args` come last.
++The allocator hands out the proxy port (`PROXY_PORTS`) for every routable worker of a
++mode the frontend proxies (`Frontend.proxied_worker_modes`), so two decode workers on
++one node never collide. The `--kv-connector` protocol comes from the decode workers' vLLM
++connector class (`VLLMBackend.kv_connector_class`, which reads a role's own
++`kv-transfer-config` before `connector`):
++
++| Decode connector | Sidecar protocol |
++| --- | --- |
++| `NixlConnector` | `nixlv2` |
++
++Any other decode connector is rejected at load time.
++
++## Endpoint discovery
++
++The EPP runs without Kubernetes when its configuration names a discovery plugin
++([`runner.go`](https://github.com/llm-d/llm-d-router/blob/a5cbe600ebade00cf3e9885beaf2bfacddeabce1/cmd/epp/runner/runner.go#L264-L273),
++[`runWithFileDiscovery`](https://github.com/llm-d/llm-d-router/blob/a5cbe600ebade00cf3e9885beaf2bfacddeabce1/cmd/epp/runner/runner.go#L1044-L1196)).
++srtctl writes three files into the log directory (every container sees it at `/logs`):
++
++- `llm-d-endpoints.yaml`: one endpoint per routable worker process (the one with an HTTP
++  port: a multi-node worker's leader), at its IPv4 address on the cluster's network
++  interface, labelled `llm-d.ai/role: prefill`, `decode`, or `both` (aggregate). A decode
++  endpoint is its sidecar's port.
++- `llm-d-epp-config.yaml`: `frontend.epp_config` with the
++  [`file-discovery`](https://github.com/llm-d/llm-d-router/blob/a5cbe600ebade00cf3e9885beaf2bfacddeabce1/pkg/epp/framework/plugins/datalayer/discovery/file/plugin.go)
++  plugin (`watchFile: false`) and `dataLayer.discovery` added. `discovery.pluginRef` is
++  the spelling v0.10 and v0.11 both accept. A recipe that configures discovery itself is
++  rejected.
++- `llm-d-envoy.yaml`: the guide's Envoy configuration with the public port, an admin
++  listener srtctl can reach, no request timeout, and an access log
++  (`llm-d-envoy-access.log`) recording, for every request, the endpoint the EPP picked
++  (`upstream=`) and the prefill worker it named (`prefiller=`).
++
++## Readiness and metrics
++
++The job is ready when Envoy's admin `/ready` answers 200 and the EPP's
++`llm_d_epp_ready_endpoints` gauge, the endpoints whose metrics it scraped within its
++staleness window
++([`llm_d_router_metrics.go`](https://github.com/llm-d/llm-d-router/blob/a5cbe600ebade00cf3e9885beaf2bfacddeabce1/pkg/epp/metrics/llm_d_router_metrics.go#L234-L241),
++[`logger.go`](https://github.com/llm-d/llm-d-router/blob/a5cbe600ebade00cf3e9885beaf2bfacddeabce1/pkg/epp/datalayer/logger/logger.go#L106-L117)),
++counts every endpoint in the file. The EPP scrapes a worker on the address it routes
++to, so a decode worker is scraped through its sidecar. Tachometer scrapes the EPP's
++Prometheus listener as the frontend; worker metrics stay on vLLM's own port.
++
++## Images
++
++The EPP, Envoy, and the sidecar run from `frontend.container_image` (the sidecar unless
++its service sets `container`), or the job container when it is unset, as the executables
++`epp`, `envoy`, and `pd-sidecar` on `PATH`. llm-d publishes the EPP and the sidecar as
++distroless images (`/app/epp`, `/app/pd-sidecar`), which pyxis cannot start: it enters a
++container through `sh`
++([`pyxis_slurmstepd.c`](https://github.com/NVIDIA/pyxis/blob/107519944221822ea1dace4db8e7234b2eaa4cd5/pyxis_slurmstepd.c#L1128-L1135)). Build an image with a shell that carries the three executables,
++for example on top of the vLLM image the workers run:
++
++<!-- docs-yaml: skip -->
++```dockerfile
++FROM vllm/vllm-openai:<tag>
++COPY --from=ghcr.io/llm-d/llm-d-router-endpoint-picker:v0.11.0 /app/epp /usr/local/bin/epp
++COPY --from=ghcr.io/llm-d/llm-d-router-disagg-sidecar:v0.11.0 /app/pd-sidecar /usr/local/bin/pd-sidecar
++COPY --from=envoyproxy/envoy:distroless-v1.33.2 /usr/local/bin/envoy /usr/local/bin/envoy
++```
++
++## Recipe
++
++```yaml
++frontend:
++  type: llm-d
++  enable_multiple_frontends: false
++  container_image: llm-d-vllm       # optional: the router image
++  epp_config:                       # EndpointPickerConfig without discovery
++    plugins: [...]
++    schedulingProfiles: [...]
++  args:                             # extra EPP flags, e.g. log verbosity
++    v: 2
++engine:
++  type: vllm
++  connector: nixl
++```
++
++`frontend.args` are passed to the EPP; the pool, configuration, and port flags are
++srtctl's. Prefill/decode needs `epp_config` with `prefill` and `decode` scheduling
++profiles and the `disagg-profile-handler`; an aggregate job without `epp_config` runs
++the EPP's built-in default profile. See
++[`examples/vllm/llm-d-disagg.yaml`](https://github.com/NVIDIA/srt-slurm/blob/main/examples/vllm/llm-d-disagg.yaml) and
++[`examples/vllm/llm-d-agg.yaml`](https://github.com/NVIDIA/srt-slurm/blob/main/examples/vllm/llm-d-agg.yaml).
++
++A vLLM worker with `data-parallel-size` is one `vllm serve` that balances its DP ranks
++itself (the leader serves the API, other nodes run headless ranks), so it is one EPP
++endpoint, as it is one SMG worker.
++
++## Limitations
++
++- vLLM workers over HTTP only; gRPC roles are rejected.
++- One router replica: the EPP keeps its scheduling state (the approximate prefix index,
++  in-flight load) in memory, so `enable_multiple_frontends` with more than one router is
++  rejected.
++- The endpoints file is written once (`watchFile: false`) and the EPP does not eject a
++  worker that fails; a crashed worker or sidecar fails the job instead.
++- The EPP routes to a worker, not to one of its DP ranks.
++- Precise prefix-cache routing (KV events into the EPP) is not wired up; use the
++  approximate prefix scorers.
+diff --git a/docs/schema-reference.md b/docs/schema-reference.md
+index c78f327f..3afc3e1b 100644
+--- a/docs/schema-reference.md
++++ b/docs/schema-reference.md
+@@ -118,7 +118,7 @@ Frontend/router configuration.
+ 
+ | Key | Type | Default | Description |
+ |---|---|---|---|
+-| `type` | str | `'dynamo'` | Frontend type - "dynamo" (default); "sglang-router" (SGLang Model Gateway), "vllm-router", "atomesh", and "tilert-router" (static routers); "sglang", "vllm", and "trtllm_serve" (direct: the single aggregate worker binds the public port, no router process); "none" (services-only job: no router, no OpenAI endpoint, no worker-count health gate; requires no engine roles). In schema 1 recipes "sglang" still means the router and loads as "sglang-router". |
++| `type` | str | `'dynamo'` | Frontend type - "dynamo" (default); "sglang-router" (SGLang Model Gateway), "vllm-router", "smg" (Shepherd Model Gateway, any backend), "llm-d" (llm-d Endpoint Picker behind Envoy, vLLM), "atomesh", and "tilert-router" (static routers); "sglang", "vllm", and "trtllm_serve" (direct: the single aggregate worker binds the public port, no router process); "none" (services-only job: no router, no OpenAI endpoint, no worker-count health gate; requires no engine roles). In schema 1 recipes "sglang" still means the router and loads as "sglang-router". |
+ | `enable_multiple_frontends` | bool | `True` | Scale with nginx + multiple routers. When ``True`` (default), srtctl stands up nginx and fans out to ``num_additional_frontends + 1`` router replicas. When ``False``, there is NO nginx proxy — the benchmark must target the single master router (or a worker) directly at ``http://localhost:<port>``. ``benchmark.command`` has no placeholder substitution, so write the URL out literally. |
+ | `num_additional_frontends` | int | `9` | Additional routers beyond master (default: 9) |
+ | `nginx_container` | str | `'nginx:1.27.4'` | Custom nginx container image (default: nginx:1.27.4) |
+@@ -127,6 +127,7 @@ Frontend/router configuration.
+ | `nginx_session_affinity_header` | str | `'X-Dynamo-Session-ID'` | Header hashed when affinity is on (default ``X-Dynamo-Session-ID``). Set ``X-Correlation-ID`` for clients (e.g. aiperf) that carry the session id in that header instead. |
+ | `nginx_keepalive_timeout` | str | `'600s'` | Idle timeout for client and upstream keepalive connections in the generated nginx.conf (default "600s"). nginx's own default is 75s, which closes a session's connection during the long recorded think-time of an agentic replay; the client's next write on that pooled socket then fails with "broken pipe" / "server disconnected" and nothing is logged server-side. |
+ | `worker_selection` | dict[str, Any] \| None | `None` | Inline Dynamo worker-selection policy configuration. srtctl writes this mapping under the top-level ``worker_selection`` key in a generated router policy YAML and passes it to the Dynamo frontend via ``--router-policy-config``. |
++| `epp_config` | dict[str, Any] \| None | `None` | llm-d Endpoint Picker configuration (``EndpointPickerConfig``: ``plugins``, ``schedulingProfiles``, ...) for ``frontend.type: llm-d``. srtctl writes it to a file with the ``file-discovery`` plugin and ``dataLayer.discovery`` added, so the EPP reads the job's workers from the endpoints file srtctl renders. Required for prefill/decode jobs (the scheduler's P/D profiles); omitted, an aggregate job runs the EPP's built-in default profile. |
+ | `args` | dict[str, Any] \| None | `None` | CLI arguments passed to the frontend/router process |
+ | `env` | dict[str, str] \| None | `None` | Environment variables for frontend processes |
+ | `container_image` | str \| None | `None` | Optional router-specific image. Static routers use the model/backend image when omitted. |
+diff --git a/docs/services.md b/docs/services.md
+index 3f5832d3..0b0bf10d 100644
+--- a/docs/services.md
++++ b/docs/services.md
+@@ -48,7 +48,7 @@ directory. `examples/features/services.yaml` is a runnable version of this.
+ ```yaml
+ services:
+   - name: my-sidecar             # required, unique across the list
+-    type: generic                # generic (default) | etcd | nats | mooncake-master | dcgm-exporter | node-exporter | mooncake-store | lmcache-server
++    type: generic                # generic (default) | etcd | nats | mooncake-master | dcgm-exporter | node-exporter | mooncake-store | lmcache-server | llm-d-sidecar
+     enabled: true                # false drops the service (the way to switch an implied one off)
+     external: null               # typed kinds only: use an instance that already runs at this address
+     command:                     # argv, not shell-interpreted; required for generic
+@@ -135,6 +135,7 @@ Things the recipe asks for elsewhere are services the job runs without an entry;
+ | a declared `mooncake-master` entry (see [Mooncake KV Store](mooncake-kv-store.md)) | `mooncake-master` | the infra node, phase `before_workers` |
+ | a vLLM role with `connector: lmcache-mp` (engine-level or `roles.<role>.args.connector`), unless a `lmcache-server` entry is declared | `lmcache-server` | that role's nodes, or every worker node when several roles use it, phase `before_workers` |
+ | `engine.failover` (see [Shadow Engine Recovery](shadow-engine-recovery.md)) | `gms` | one instance per vLLM worker (`placement.per: worker`), phase `before_workers` |
++| `frontend.type: llm-d` with prefill and decode workers (see [llm-d Router](llm-d.md)) | `llm-d-sidecar` | one instance per routable decode worker (`placement.per: worker`), phase `before_workers` |
+ | tachometer on (the default; `observability.tachometer.enabled`) | `dcgm-exporter`, `node-exporter` | every worker node, phase `after_frontend` |
+ 
+ `srtctl dry-run` lists them next to the declared ones, marked `implied by:`. A declared entry with
+@@ -191,7 +192,7 @@ node are rejected before anything launches; give them disjoint placements or por
+ of the placed role(s) on each selected node (`node` must be `prefill`, `decode`, `agg`, or `workers`),
+ a sidecar in the Kubernetes sense. The instance runs in that worker's device view (its
+ `CUDA_VISIBLE_DEVICES`, the same pinning the worker's engine steps get) and sees `{worker_role}`,
+-`{worker_index}`, `{worker_node_rank}`, `{worker_gpus}` and `{worker_gpu_count}`. Its step and log are
++`{worker_index}`, `{worker_node_rank}`, `{worker_gpus}` and `{worker_gpu_count}`, plus `{worker_http_port}` when the worker serves an API and `{worker_proxy_port}` when the frontend reaches it through a proxy (`Process.proxy_port`). The kind decides which workers get an instance: every one by default; the `llm-d-sidecar` only the routable decode workers it fronts. Its step and log are
+ `service_<name>_<role>_<index>_<node>`. Because the instances of one node share its network namespace,
+ a per-worker service's `readiness` must be a log probe. The GPU Memory Service of
+ [shadow engine recovery](shadow-engine-recovery.md) is the built-in per-worker kind:
+@@ -305,6 +306,7 @@ environment its process needs; the launch path is shared by every kind. Register
+ | `mooncake-store` | `python -m mooncake.mooncake_store_service` | `before_workers` | `true` | Requires a `mooncake-master` entry. Container falls back to the master's. Injects the master's address. |
+ | `lmcache-server` | `lmcache server` bound to the RPC and HTTP ports srtctl owns (8750, 8751) | `before_workers` | `true` | One per worker node (`placement.node: workers`); vLLM ranks reach it over localhost with `connector: lmcache-mp`, which implies it. SGLang workers started with `enable-lmcache` get `LMCACHE_MP_HOST`/`LMCACHE_MP_PORT` pointing at it unless the recipe sets `lmcache-config-file` or `LMCACHE_MP_HOST`. Services do not inherit the top-level `environment:`, so set `PYTHONHASHSEED` in its `env:` when the workers set it. `args` are appended (`--l1-size-gb`, `--chunk-size`, `--max-workers`, ...). Ready when `GET /healthcheck` answers; LMCache must be installed in the job container. |
+ | `ray` | `ray start --head ...` on the first instance, `ray start --address=<head>:6379 ...` on the rest, both `--block` | `before_workers` | `true` | One Ray cluster across the service's nodes; see [Ray cluster](#ray-cluster). Placement `workers` (default), `head`, or `all`. `options`: `port` (GCS, 6379), `dashboard_port` (8265), `num_gpus` (the node's count). `args` are appended to every `ray start`. |
++| `llm-d-sidecar` | `pd-sidecar --port=<proxy port> --model-server-port=<worker port> --kv-connector=<protocol> --secure-proxy=false` in `frontend.container_image`, else the job container | `before_workers` | `true` | Implied by `frontend.type: llm-d` for prefill/decode; see [llm-d Router](llm-d.md). `placement.per: worker` on decode: one instance per routable decode worker, bound to its allocated `Process.proxy_port`. `command` replaces the executable, `args` are appended. Ready when `GET /health` on its port answers. |
+ | `gms` | one `python3 -m gpu_memory_service --device k` per GPU of the worker, supervised by bash, in the job container | `before_workers` | `true` | Implied by `engine.failover`; see [Shadow Engine Recovery](shadow-engine-recovery.md). `placement.per: worker` (required): one instance per vLLM worker in that worker's device view, sockets and lock file under `<shared_dir>/srtctl-<job>/<role>_<index>`. Ready when its log says `GMS ready:`; `readiness.timeout_seconds` (default 120) also bounds the servers' startup. |
+ 
+ ### Ray cluster
+diff --git a/docs/smg.md b/docs/smg.md
+new file mode 100644
+index 00000000..678e84d2
+--- /dev/null
++++ b/docs/smg.md
+@@ -0,0 +1,164 @@
++# Shepherd Model Gateway (SMG)
++
++`frontend.type: smg` runs the [Shepherd Model Gateway](https://github.com/smg-project/smg)
++in front of direct engine workers. SMG is an engine-agnostic Rust gateway with an
++OpenAI-compatible API; srtctl hands it the statically allocated worker URLs, the same
++way it does for the other static routers. No Dynamo, NATS, or etcd is involved.
++
++Upstream references below are pinned to SMG
++[v1.11.0](https://github.com/smg-project/smg/tree/3be823a700fabaff3add8a390cf78f163479d686).
++
++## Supported topologies
++
++| Topology | Backends | What srtctl launches |
++| --- | --- | --- |
++| Aggregated | any engine whose workers serve HTTP (`sglang`, `vllm`, `trtllm`, ...) | `smg launch --worker-urls <url> ...` |
++| Prefill/decode | `sglang` | `smg launch --pd-disaggregation --prefill <url> <bootstrap-port> --decode <url>` |
++| Prefill/decode | `vllm` with `grpc: true` and `connector: nixl` | `smg launch --pd-disaggregation --prefill grpc://<host:port> ... --decode grpc://<host:port>` |
++
++SMG detects each HTTP worker's engine itself (`/v1/models` `owned_by`, then `/version`
++and `/server_info`) and reads the served model name from the worker
++([`detect_backend.rs`](https://github.com/smg-project/smg/blob/3be823a700fabaff3add8a390cf78f163479d686/model_gateway/src/workflow/steps/local/detect_backend.rs#L182-L191),
++[`discover_metadata.rs`](https://github.com/smg-project/smg/blob/3be823a700fabaff3add8a390cf78f163479d686/model_gateway/src/workflow/steps/local/discover_metadata.rs#L230-L239)),
++so srtctl passes no `--backend` and no model name. SMG routes a request only to workers
++serving the model it names
++([`router.rs`](https://github.com/smg-project/smg/blob/3be823a700fabaff3add8a390cf78f163479d686/model_gateway/src/routers/http/router.rs#L249-L252)),
++so clients send the workers' served model name, as srtctl's benchmarks do.
++
++A TensorRT-LLM worker is a plain `trtllm-serve` OpenAI server on its allocated port.
++Its `/v1/models` reports `owned_by: "tensorrt_llm"`, which SMG does not match, and it
++serves `/version`, so SMG records it as `vllm`
++([`openai_protocol.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/089dce4f30b36bb979ce157e26eb2ece4b52c7e0/tensorrt_llm/serve/openai_protocol.py#L138),
++[`openai_server.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/089dce4f30b36bb979ce157e26eb2ece4b52c7e0/tensorrt_llm/serve/openai_server.py#L918-L919),
++[`detect_backend.rs`](https://github.com/smg-project/smg/blob/3be823a700fabaff3add8a390cf78f163479d686/model_gateway/src/workflow/steps/local/detect_backend.rs#L122-L123),
++[fallback](https://github.com/smg-project/smg/blob/3be823a700fabaff3add8a390cf78f163479d686/model_gateway/src/workflow/steps/local/detect_backend.rs#L223-L235)).
++For an aggregated worker that label only selects the metadata reader, which takes the
++served model name from `/v1/models`
++([`discover_metadata.rs`](https://github.com/smg-project/smg/blob/3be823a700fabaff3add8a390cf78f163479d686/model_gateway/src/workflow/steps/local/discover_metadata.rs#L403-L406));
++the HTTP router forwards the OpenAI request unchanged. `--backend trtllm` would not
++change this: over HTTP and gRPC SMG keeps auto-detection and uses `--backend` only to
++pick the routing mode
++([`main.rs`](https://github.com/smg-project/smg/blob/3be823a700fabaff3add8a390cf78f163479d686/model_gateway/src/main.rs#L1840-L1853)). SMG's TRT-LLM runtime is
++its gRPC client for `trtllm-serve --grpc`, which srtctl does not launch for this frontend.
++
++SGLang P/D runs over HTTP. SMG's HTTP P/D router hands the KV cache over through
++SGLang's bootstrap rendezvous (`bootstrap_host` / `bootstrap_port` / `bootstrap_room`,
++[`pd_router.rs`](https://github.com/smg-project/smg/blob/3be823a700fabaff3add8a390cf78f163479d686/model_gateway/src/routers/http/pd_router.rs#L303-L305)).
++A vLLM worker registered by URL carries no KV connector, so SMG sends the request through
++and the decode worker recomputes the prompt
++([upstream test note](https://github.com/smg-project/smg/blob/3be823a700fabaff3add8a390cf78f163479d686/e2e_test/router/test_pd_topologies.py#L105-L110)).
++srtctl does not reject that layout, but it is not a KV-disaggregated run.
++
++vLLM P/D therefore runs over gRPC. With `grpc: true` in both roles' `args` each worker is
++`vllm serve --grpc`, vLLM's gRPC server, which the `smg-grpc-servicer` package provides
++(vLLM's `grpc` extra), and srtctl advertises it as `grpc://`. The servicer reports the
++worker's `kv_transfer_config` connector in `GetServerInfo`
++([`servicer.py`](https://github.com/smg-project/smg/blob/3be823a700fabaff3add8a390cf78f163479d686/grpc_servicer/smg_grpc_servicer/vllm/servicer.py#L702-L709)), so for
++`NixlConnector` SMG tags the prefill leg with `do_remote_decode` and relays the
++`kv_transfer_params` the prefill returns to the decode leg, which pulls the KV cache over
++NIXL
++([`request_execution.rs`](https://github.com/smg-project/smg/blob/3be823a700fabaff3add8a390cf78f163479d686/model_gateway/src/routers/grpc/common/stages/request_execution.rs#L962-L1010),
++[`kv_transfer.rs`](https://github.com/smg-project/smg/blob/3be823a700fabaff3add8a390cf78f163479d686/model_gateway/src/routers/common/kv_transfer.rs#L16-L19),
++[upstream test](https://github.com/smg-project/smg/blob/3be823a700fabaff3add8a390cf78f163479d686/e2e_test/router/test_pd_nixl.py#L1-L11)). `engine.connector: nixl`
++gives both roles `NixlConnector` and the per-worker NIXL side channel. In gRPC mode SMG
++tokenizes and applies the chat template itself; pass `tool-call-parser` /
++`reasoning-parser` in `frontend.args` when the model needs them. vLLM's gRPC server
++starts no HTTP listener, so these workers serve no Prometheus `/metrics`; SMG's own
++metrics stay on its Prometheus port. See
++[`examples/vllm/smg-disagg-grpc.yaml`](../examples/vllm/smg-disagg-grpc.yaml).
++
++TRT-LLM P/D is not available behind SMG: its gRPC P/D table has no TRT-LLM entry
++([`pd_protocol.rs`](https://github.com/smg-project/smg/blob/3be823a700fabaff3add8a390cf78f163479d686/model_gateway/src/routers/grpc/common/stages/pd_protocol.rs#L63-L85)),
++and over HTTP SMG relays only vLLM-style `kv_transfer_params`. Use `trtllm-serve` disaggregated
++serving (`frontend.type: trtllm_serve`) or Dynamo for TRT-LLM P/D.
++
++## vLLM data parallel
++
++A vLLM aggregated role with `data-parallel-size` (DP, optionally with
++`enable-expert-parallel`) is one `vllm serve` that load-balances its DP ranks itself.
++Across nodes, the leader node serves the API and the other nodes run headless engine
++ranks (`--nnodes`/`--node-rank`), so SMG receives one worker URL per DP deployment.
++This is the layout `frontend.type: vllm` uses, with the API on an allocated port.
++
++SMG's `--dp-aware` rank pinning is not used: it discovers `dp_size` over HTTP only
++from SGLang workers and registers any other HTTP worker as a plain worker
++([`discover_dp.rs`](https://github.com/smg-project/smg/blob/3be823a700fabaff3add8a390cf78f163479d686/model_gateway/src/workflow/steps/local/discover_dp.rs#L145-L156));
++for vLLM it needs gRPC workers
++([`discover_dp.rs`](https://github.com/smg-project/smg/blob/3be823a700fabaff3add8a390cf78f163479d686/model_gateway/src/workflow/steps/local/discover_dp.rs#L127-L141)),
++which srtctl does not configure. See
++[`examples/vllm/smg-dep16.yaml`](../examples/vllm/smg-dep16.yaml).
++
++## Configuration
++
++```yaml
++frontend:
++  type: smg
++  container_image: smg # an image that ships SMG, e.g. lightseekorg/smg:1.11.0
++  enable_multiple_frontends: false
++  args:
++    policy: cache_aware # any `smg launch` flag
++```
++
++- `container_image`: an engine image need not ship SMG. Point this at an image
++  with the `smg` command (the official `lightseekorg/smg` image, or any image where
++  `pip install smg` was run). Without it the model container is reused.
++- `setup_script`: the recipe's setup script also runs in SMG's container before
++  `smg launch`, so a script that runs `pip install smg==1.11.0` (a manylinux wheel)
++  makes the model image serve as the router image.
++- `args`: passed to `smg launch` as `--<key> <value>`; `true` adds a bare flag and a
++  list repeats the flag. `prometheus-port` is managed by srtctl and rejected here.
++- `enable_multiple_frontends` / `num_additional_frontends`: as for every router,
++  several SMG replicas behind nginx, or one SMG on the public port.
++
++See [`examples/vllm/smg-agg.yaml`](../examples/vllm/smg-agg.yaml) (vLLM, aggregated),
++[`examples/vllm/smg-dep16.yaml`](../examples/vllm/smg-dep16.yaml) (vLLM, two-node DP16 with EP),
++[`examples/trtllm/smg-agg.yaml`](../examples/trtllm/smg-agg.yaml) (TRT-LLM, aggregated)
++and [`examples/sglang/smg-disagg.yaml`](../examples/sglang/smg-disagg.yaml) (SGLang, P/D).
++
++## Launch and readiness
++
++- **Command.** `smg launch`
++  ([subcommand](https://github.com/smg-project/smg/blob/3be823a700fabaff3add8a390cf78f163479d686/model_gateway/src/main.rs#L153-L160)) with `--host 0.0.0.0 --port <frontend port>` and the
++  workers from the allocated topology: `--worker-urls` for aggregated workers;
++  `--pd-disaggregation`, one `--prefill URL BOOTSTRAP_PORT` per prefill worker and one
++  `--decode URL` per decode worker for P/D
++  ([`main.rs`](https://github.com/smg-project/smg/blob/3be823a700fabaff3add8a390cf78f163479d686/model_gateway/src/main.rs#L35-L72),
++  [CLI arguments](https://github.com/smg-project/smg/blob/3be823a700fabaff3add8a390cf78f163479d686/model_gateway/src/main.rs#L213-L237),
++  [P/D arguments](https://github.com/smg-project/smg/blob/3be823a700fabaff3add8a390cf78f163479d686/model_gateway/src/main.rs#L494-L509)).
++  The Python package (what `pip install smg` and the official image install) provides
++  the same `smg launch` subcommand and flags
++  ([`cli.py`](https://github.com/smg-project/smg/blob/3be823a700fabaff3add8a390cf78f163479d686/bindings/python/src/smg/cli.py#L76-L82),
++  [`router_args.py`](https://github.com/smg-project/smg/blob/3be823a700fabaff3add8a390cf78f163479d686/bindings/python/src/smg/router_args.py#L843-L876)).
++- **Worker probe before start.** SMG waits at most `--worker-startup-timeout-secs`
++  (1800 s by default,
++  [`main.rs`](https://github.com/smg-project/smg/blob/3be823a700fabaff3add8a390cf78f163479d686/model_gateway/src/main.rs#L522-L524))
++  for a startup worker to register, and a large model can load for longer, so srtctl
++  waits for every advertised worker's `/health` to answer 200 (a gRPC worker: its port to
++  accept connections) before it starts SMG.
++- **Readiness.** srtctl polls SMG's `GET /workers` and waits until
++  `stats.prefill_count`, `stats.decode_count` and `stats.regular_count` cover the
++  expected workers; aggregated workers count as `regular`
++  ([route](https://github.com/smg-project/smg/blob/3be823a700fabaff3add8a390cf78f163479d686/model_gateway/src/server.rs#L993),
++  [response](https://github.com/smg-project/smg/blob/3be823a700fabaff3add8a390cf78f163479d686/model_gateway/src/worker/service.rs#L204-L241)).
++- **Metrics.** SMG serves Prometheus on its own listener. srtctl passes
++  `--prometheus-port 29000` (on every interface, SMG's default host) and points
++  tachometer's frontend target there
++  ([`main.rs`](https://github.com/smg-project/smg/blob/3be823a700fabaff3add8a390cf78f163479d686/model_gateway/src/main.rs#L741-L748)).
++  Workers are scraped on their own HTTP ports, as with the other static routers, at
++  the engine's Prometheus route (`native_metrics_path`): `/metrics`, or
++  `/prometheus/metrics` for trtllm-serve, whose `/metrics` is JSON iteration stats.
++  trtllm-serve mounts that route only with `return_perf_metrics: true`
++  ([`openai_server.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/089dce4f30b36bb979ce157e26eb2ece4b52c7e0/tensorrt_llm/serve/openai_server.py#L890-L913)),
++  which srtctl sets by default for every TRT-LLM role behind a direct-worker frontend.
++- **Logs.** Each replica writes `<node>_smg_<index>.out` in the job log directory and
++  runs as the Slurm step `smg_<index>`.
++
++## Not wired
++
++srtctl advertises a worker over HTTP unless its backend reports gRPC for the role
++(`BackendProtocol.is_grpc_mode`: SGLang `grpc-mode: true`, vLLM `grpc: true`), and
++then as `grpc://`. Before SMG starts, a gRPC worker is probed by connecting to its
++port (vLLM's gRPC server binds it only once the engine is up), an HTTP worker on `/health`.
++SMG's ZMQ and encode (EPD) worker modes, its Kubernetes service discovery, mesh, and the cloud-provider, history, MCP
++and WASM features are not configured by srtctl; `frontend.args` can still pass any
++`smg launch` flag that needs no srtctl-managed process or port.
+diff --git a/examples/README.md b/examples/README.md
+index cc454b34..2bb57e0e 100644
+--- a/examples/README.md
++++ b/examples/README.md
+@@ -6,13 +6,13 @@ Small, runnable starting points, one per frontend and topology. Every example se
+ 
+ | Backend | Dynamo frontend | Native router | Router-free direct |
+ | --- | --- | --- | --- |
+-| SGLang | `sglang/dynamo-agg.yaml`, `sglang/dynamo-disagg.yaml` | `sglang/sglang-router-agg.yaml`, `sglang/sglang-router-disagg.yaml` | `sglang/sglang-direct-agg.yaml` |
+-| vLLM | `vllm/dynamo-agg.yaml`, `vllm/dynamo-disagg.yaml` | `vllm/vllm-router-agg.yaml`, `vllm/vllm-router-disagg.yaml`, `vllm/vllm-router-moriio-disagg.yaml` (ROCm, MoRI-IO discovery) | `vllm/vllm-direct-agg.yaml` |
+-| TRT-LLM | `trtllm/dynamo-agg.yaml`, `trtllm/dynamo-disagg.yaml` | `trtllm/trtllm-serve-disagg.yaml` | `trtllm/trtllm-serve-agg.yaml` |
++| SGLang | `sglang/dynamo-agg.yaml`, `sglang/dynamo-disagg.yaml` | `sglang/sglang-router-agg.yaml`, `sglang/sglang-router-disagg.yaml`, `sglang/smg-disagg.yaml` (SMG) | `sglang/sglang-direct-agg.yaml` |
++| vLLM | `vllm/dynamo-agg.yaml`, `vllm/dynamo-disagg.yaml` | `vllm/vllm-router-agg.yaml`, `vllm/vllm-router-disagg.yaml`, `vllm/vllm-router-moriio-disagg.yaml` (ROCm, MoRI-IO discovery), `vllm/smg-agg.yaml`, `vllm/smg-dep16.yaml`, `vllm/smg-disagg-grpc.yaml` (SMG; P/D over gRPC with NIXL), `vllm/llm-d-agg.yaml`, `vllm/llm-d-disagg.yaml` (llm-d EPP behind Envoy; P/D through the llm-d sidecar) | `vllm/vllm-direct-agg.yaml` |
++| TRT-LLM | `trtllm/dynamo-agg.yaml`, `trtllm/dynamo-disagg.yaml` | `trtllm/trtllm-serve-disagg.yaml`, `trtllm/smg-agg.yaml` (SMG) | `trtllm/trtllm-serve-agg.yaml` |
+ | Mocker | `mocker/dynamo-agg.yaml` | | |
+ 
+ - **Dynamo frontend**: workers register with etcd and the Dynamo frontend routes (KV-aware here); the request plane is tcp and NATS is not started unless a plane asks for it. Dynamo is installed at job start via `dynamo.source` (`pypi:` here) unless the container ships it (`dynamo.install: false`, as the TRT-LLM examples do).
+-- **Native router**: the engine's own router in front of plain engine workers. No Dynamo, NATS, or etcd. SGLang uses the Model Gateway (`frontend.type: sglang-router`), vLLM the official vLLM Router (`vllm-router`), TRT-LLM `trtllm-serve disaggregated` with a generated `ser.yaml`.
++- **Native router**: the engine's own router in front of plain engine workers. No Dynamo, NATS, or etcd. SGLang uses the Model Gateway (`frontend.type: sglang-router`), vLLM the official vLLM Router (`vllm-router`), TRT-LLM `trtllm-serve disaggregated` with a generated `ser.yaml`. The `smg` examples put the engine-agnostic [Shepherd Model Gateway](../docs/smg.md) (`frontend.type: smg`) in front of the same workers, run from its own image.
+ - **Router-free direct**: one worker owns the public port. `frontend.type: sglang`, `frontend.type: vllm`, and `frontend.type: trtllm_serve` in aggregate mode launch no router process.
+ - **Mocker**: `dynamo.mocker` stands in for an engine, so the whole orchestration path runs without loading weights. The fastest way to validate a cluster config.
+ 
+@@ -52,6 +52,8 @@ containers:
+   dynamo-vllm: /path/to/vllm-runtime.sqsh   # Dynamo vLLM runtime image (ships ai-dynamo and gpu_memory_service), for features/vllm-failover.yaml
+   vllm-lmcache: /path/to/vllm-lmcache.sqsh  # vLLM image with LMCache installed, for features/lmcache-server.yaml and -disagg.yaml
+   sglang-lmcache: /path/to/sglang-lmcache.sqsh  # SGLang image with LMCache installed, for features/lmcache-server-sglang.yaml
++  smg: /path/to/smg.sqsh                    # Shepherd Model Gateway image (lightseekorg/smg), the router for the smg examples
++  llm-d-vllm: /path/to/llm-d-vllm.sqsh      # vLLM image with epp, pd-sidecar and envoy on PATH, for the llm-d examples (docs/llm-d.md#images)
+ ```
+ 
+ `resources.gpu_type` and `gpus_per_node` are set to `h100` and `8`; change them to match the partition you submit to.
+diff --git a/examples/sglang/smg-disagg.yaml b/examples/sglang/smg-disagg.yaml
+new file mode 100644
+index 00000000..7ae710d9
+--- /dev/null
++++ b/examples/sglang/smg-disagg.yaml
+@@ -0,0 +1,63 @@
++# SGLang disaggregated prefill/decode behind the Shepherd Model Gateway (SMG).
++#
++# One TP1 prefill worker and one TP1 decode worker sharing a node (`nodes: colocate`
++# places decode on the prefill node's spare GPUs). srtctl adds `--disaggregation-mode`
++# and the prefill bootstrap port; SMG is launched with `--pd-disaggregation`, gets the
++# prefill URL with that bootstrap port, and pairs each request across the two workers.
++# SMG runs from its own image (`frontend.container_image`).
++#
++# Aliases (`qwen3-0.6b`, `sglang`, `smg`) resolve through srtslurm.yaml; see examples/README.md.
++
++schema: 2
++name: "qwen3-0.6b-sglang-smg-disagg"
++
++slurm:
++  time_limit: "00:30:00"
++
++model:
++  path: "qwen3-0.6b"
++  container: "sglang"
++  precision: "bf16"
++
++resources:
++  gpu_type: "h100"
++  gpus_per_node: 8
++frontend:
++  type: smg
++  container_image: smg
++  enable_multiple_frontends: false
++  args:
++    policy: "cache_aware"
++
++engine: sglang
++roles:
++  prefill:
++    nodes: 1
++    workers: 1
++    gpus: 1
++    env:
++      PYTHONUNBUFFERED: "1"
++    args:
++      served-model-name: "Qwen/Qwen3-0.6B"
++      tensor-parallel-size: 1
++      mem-fraction-static: 0.5
++      context-length: 4096
++      disable-piecewise-cuda-graph: true
++  decode:
++    nodes: colocate
++    workers: 1
++    gpus: 1
++    env:
++      PYTHONUNBUFFERED: "1"
++    args:
++      served-model-name: "Qwen/Qwen3-0.6B"
++      tensor-parallel-size: 1
++      mem-fraction-static: 0.5
++      context-length: 4096
++      disable-piecewise-cuda-graph: true
++
++benchmark:
++  type: "sa-bench"
++  isl: 128
++  osl: 128
++  concurrencies: "4x8"
+diff --git a/examples/trtllm/smg-agg.yaml b/examples/trtllm/smg-agg.yaml
+new file mode 100644
+index 00000000..a08a9c7c
+--- /dev/null
++++ b/examples/trtllm/smg-agg.yaml
+@@ -0,0 +1,57 @@
++# TRT-LLM aggregated behind the Shepherd Model Gateway (SMG).
++#
++# Two TP1 `trtllm-serve` workers on one node, each on its own allocated port;
++# SMG receives them through `--worker-urls` and routes with its cache-aware
++# policy. `frontend.type: trtllm_serve` aggregate mode allows one worker only.
++# No Dynamo, NATS, or etcd. SMG runs from its own image (`frontend.container_image`).
++#
++# Aliases (`qwen3-0.6b`, `trtllm`, `smg`) resolve through srtslurm.yaml; see examples/README.md.
++
++schema: 2
++name: "qwen3-0.6b-trtllm-smg-agg"
++
++slurm:
++  time_limit: "00:30:00"
++
++model:
++  path: "qwen3-0.6b"
++  container: "trtllm"
++  precision: "bf16"
++
++resources:
++  gpu_type: "h100"
++  gpus_per_node: 8
++frontend:
++  type: smg
++  container_image: smg
++  enable_multiple_frontends: false
++  args:
++    policy: "cache_aware"
++
++engine:
++  type: trtllm
++  # API model name shared by the workers, SMG, and the benchmark client.
++  served_model_name: "Qwen/Qwen3-0.6B"
++roles:
++  agg:
++    nodes: 1
++    workers: 2
++    gpus: 1
++    env:
++      PYTHONUNBUFFERED: "1"
++      TLLM_LOG_LEVEL: "INFO"
++    args:
++      backend: "pytorch"
++      tensor_parallel_size: 1
++      max_batch_size: 64
++      max_num_tokens: 8192
++      max_seq_len: 4096
++      trust_remote_code: true
++      kv_cache_config:
++        free_gpu_memory_fraction: 0.5
++
++benchmark:
++  type: "sa-bench"
++  isl: 128
++  osl: 128
++  concurrencies: "4x8"
+diff --git a/examples/vllm/llm-d-agg.yaml b/examples/vllm/llm-d-agg.yaml
+new file mode 100644
+index 00000000..fc69f058
+--- /dev/null
++++ b/examples/vllm/llm-d-agg.yaml
+@@ -0,0 +1,63 @@
++# Two aggregated vLLM workers behind the llm-d router (docs/llm-d.md).
++#
++# On the router node srtctl starts llm-d's Endpoint Picker (EPP) and Envoy on the
++# public port; the EPP reads both workers from an endpoints file srtctl writes and
++# picks one per request with the scorers below.
++#
++# Aliases (`qwen3-0.6b`, `llm-d-vllm`) resolve through srtslurm.yaml; see
++# examples/README.md. `llm-d-vllm` is a vLLM image that also ships the `epp`,
++# `pd-sidecar`, and `envoy` executables on PATH (docs/llm-d.md#images).
++
++schema: 2
++name: "qwen3-0.6b-vllm-llm-d-agg"
++
++slurm:
++  time_limit: "00:30:00"
++
++model:
++  path: "qwen3-0.6b"
++  container: "llm-d-vllm"
++  precision: "bf16"
++
++resources:
++  gpu_type: "h100"
++  gpus_per_node: 8
++frontend:
++  type: llm-d
++  enable_multiple_frontends: false
++  # Prefix-cache affinity weighted over queue depth; srtctl adds the file-discovery plugin.
++  epp_config:
++    plugins:
++      # Hashes each prompt's blocks into the prefix index the prefix-cache scorer reads.
++      - type: approx-prefix-cache-producer
++      - type: prefix-cache-scorer
++      - type: queue-scorer
++      - type: max-score-picker
++    schedulingProfiles:
++      - name: default
++        plugins:
++          - pluginRef: prefix-cache-scorer
++            weight: 3
++          - pluginRef: queue-scorer
++            weight: 2
++          - pluginRef: max-score-picker
++
++engine: vllm
++roles:
++  agg:
++    nodes: 1
++    workers: 2
++    gpus: 1
++    env:
++      PYTHONUNBUFFERED: "1"
++    args:
++      served-model-name: "Qwen/Qwen3-0.6B"
++      tensor-parallel-size: 1
++      gpu-memory-utilization: 0.5
++      max-model-len: 4096
++
++benchmark:
++  type: "sa-bench"
++  isl: 128
++  osl: 128
++  concurrencies: "4x8"
+diff --git a/examples/vllm/llm-d-disagg.yaml b/examples/vllm/llm-d-disagg.yaml
+new file mode 100644
+index 00000000..d3df5ba5
+--- /dev/null
++++ b/examples/vllm/llm-d-disagg.yaml
+@@ -0,0 +1,94 @@
++# vLLM disaggregated prefill/decode behind the llm-d router (docs/llm-d.md).
++#
++# One TP1 prefill and one TP1 decode `vllm serve` worker sharing a node, KV over
++# NIXL. On the router node srtctl starts llm-d's Endpoint Picker (EPP), which
++# reads the workers from an endpoints file srtctl writes, and Envoy on the public
++# port. The decode worker sits behind llm-d's P/D sidecar, a service the
++# frontend implies (`llm-d-sidecar`, one per decode worker, started before the
++# workers): the EPP picks the decode sidecar and a prefill worker for each
++# request, and the sidecar runs the prefill before handing the KV transfer
++# parameters to its vLLM.
++#
++# Aliases (`qwen3-0.6b`, `llm-d-vllm`) resolve through srtslurm.yaml; see
++# examples/README.md. `llm-d-vllm` is a vLLM image that also ships the `epp`,
++# `pd-sidecar`, and `envoy` executables on PATH (docs/llm-d.md#images).
++
++schema: 2
++name: "qwen3-0.6b-vllm-llm-d-disagg"
++
++slurm:
++  time_limit: "00:30:00"
++
++model:
++  path: "qwen3-0.6b"
++  container: "llm-d-vllm"
++  precision: "bf16"
++
++resources:
++  gpu_type: "h100"
++  gpus_per_node: 8
++frontend:
++  type: llm-d
++  enable_multiple_frontends: false
++  # The EPP's scheduler: decode and prefill profiles, picked by the disaggregation
++  # profile handler; srtctl adds the file-discovery plugin.
++  epp_config:
++    plugins:
++      # Hashes each prompt's blocks into the prefix index the prefix-cache scorer reads.
++      - type: approx-prefix-cache-producer
++      - type: prefill-filter
++      - type: decode-filter
++      - type: prefix-cache-scorer
++      - type: queue-scorer
++      - type: always-disagg-pd-decider
++      - type: disagg-profile-handler
++        parameters:
++          deciders:
++            prefill: always-disagg-pd-decider
++      - type: max-score-picker
++    schedulingProfiles:
++      - name: prefill
++        plugins:
++          - pluginRef: prefill-filter
++          - pluginRef: prefix-cache-scorer
++            weight: 2
++          - pluginRef: queue-scorer
++          - pluginRef: max-score-picker
++      - name: decode
++        plugins:
++          - pluginRef: decode-filter
++          - pluginRef: queue-scorer
++          - pluginRef: max-score-picker
++
++engine:
++  type: vllm
++  connector: nixl
++roles:
++  prefill:
++    nodes: 1
++    workers: 1
++    gpus: 1
++    env:
++      PYTHONUNBUFFERED: "1"
++    args:
++      served-model-name: "Qwen/Qwen3-0.6B"
++      tensor-parallel-size: 1
++      gpu-memory-utilization: 0.5
++      max-model-len: 4096
++  decode:
++    nodes: colocate
++    workers: 1
++    gpus: 1
++    env:
++      PYTHONUNBUFFERED: "1"
++    args:
++      served-model-name: "Qwen/Qwen3-0.6B"
++      tensor-parallel-size: 1
++      gpu-memory-utilization: 0.5
++      max-model-len: 4096
++
++benchmark:
++  type: "sa-bench"
++  isl: 128
++  osl: 128
++  concurrencies: "4x8"
+diff --git a/examples/vllm/smg-agg.yaml b/examples/vllm/smg-agg.yaml
+new file mode 100644
+index 00000000..aa38d839
+--- /dev/null
++++ b/examples/vllm/smg-agg.yaml
+@@ -0,0 +1,49 @@
++# vLLM aggregated behind the Shepherd Model Gateway (SMG).
++#
++# Two TP1 `vllm serve` workers on one node; SMG receives them through
++# `--worker-urls`, detects the engine from each worker, and routes with its
++# cache-aware policy. No Dynamo, NATS, or etcd. SMG runs from its own image
++# (`frontend.container_image`), so the model container needs no router package.
++#
++# Aliases (`qwen3-0.6b`, `vllm`, `smg`) resolve through srtslurm.yaml; see examples/README.md.
++
++schema: 2
++name: "qwen3-0.6b-vllm-smg-agg"
++
++slurm:
++  time_limit: "00:30:00"
++
++model:
++  path: "qwen3-0.6b"
++  container: "vllm"
++  precision: "bf16"
++
++resources:
++  gpu_type: "h100"
++  gpus_per_node: 8
++frontend:
++  type: smg
++  container_image: smg
++  enable_multiple_frontends: false
++  args:
++    policy: "cache_aware"
++
++engine: vllm
++roles:
++  agg:
++    nodes: 1
++    workers: 2
++    gpus: 1
++    env:
++      PYTHONUNBUFFERED: "1"
++    args:
++      served-model-name: "Qwen/Qwen3-0.6B"
++      tensor-parallel-size: 1
++      gpu-memory-utilization: 0.5
++      max-model-len: 4096
++
++benchmark:
++  type: "sa-bench"
++  isl: 128
++  osl: 128
++  concurrencies: "4x8"
+diff --git a/examples/vllm/smg-dep16.yaml b/examples/vllm/smg-dep16.yaml
+new file mode 100644
+index 00000000..9bd1c5ad
+--- /dev/null
++++ b/examples/vllm/smg-dep16.yaml
+@@ -0,0 +1,49 @@
++# vLLM data parallel 16 with expert parallelism across two nodes, behind the
++# Shepherd Model Gateway (SMG).
++#
++# One `vllm serve` spans both nodes: node 0 serves the API and balances requests
++# over all 16 DP ranks itself, node 1 runs headless engine ranks. SMG therefore
++# receives a single worker URL. SMG's --dp-aware rank pinning discovers dp_size
++# from SGLang HTTP or gRPC workers only, not from vLLM HTTP workers (docs/smg.md).
++#
++# Aliases (`vllm`, `smg`) resolve through srtslurm.yaml; see examples/README.md.
++
++schema: 2
++name: "qwen3-30b-a3b-vllm-smg-dep16"
++
++slurm:
++  time_limit: "00:30:00"
++
++model:
++  path: "hf:Qwen/Qwen3-30B-A3B"
++  container: "vllm"
++  precision: "bf16"
++
++resources:
++  gpu_type: "h100"
++  gpus_per_node: 8
++frontend:
++  type: smg
++  container_image: smg
++  enable_multiple_frontends: false
++
++engine: vllm
++roles:
++  agg:
++    nodes: 2
++    workers: 1
++    gpus: 16
++    env:
++      PYTHONUNBUFFERED: "1"
++    args:
++      served-model-name: "Qwen/Qwen3-30B-A3B"
++      tensor-parallel-size: 1
++      data-parallel-size: 16
++      enable-expert-parallel: true
++      max-model-len: 4096
++
++benchmark:
++  type: "sa-bench"
++  isl: 128
++  osl: 128
++  concurrencies: "16x32"
+diff --git a/examples/vllm/smg-disagg-grpc.yaml b/examples/vllm/smg-disagg-grpc.yaml
+new file mode 100644
+index 00000000..d613978c
+--- /dev/null
++++ b/examples/vllm/smg-disagg-grpc.yaml
+@@ -0,0 +1,65 @@
++# vLLM disaggregated prefill/decode behind the Shepherd Model Gateway (SMG), over gRPC
++# with the NIXL KV connector.
++#
++# `grpc: true` makes each worker `vllm serve --grpc` (vLLM's gRPC server, provided by
++# the smg-grpc-servicer package, which the vLLM image must have). srtctl advertises the
++# workers as grpc:// URLs; SMG reads each worker's KV connector over gRPC, tags the
++# prefill leg for a remote decode and relays the returned NIXL handoff to the decode
++# worker, which pulls the prompt's KV cache instead of recomputing it. Over HTTP SMG
++# cannot learn a vLLM worker's connector, so vLLM P/D needs gRPC (docs/smg.md).
++#
++# Aliases (`qwen3-0.6b`, `vllm`, `smg`) resolve through srtslurm.yaml; see examples/README.md.
++
++schema: 2
++name: "qwen3-0.6b-vllm-smg-disagg-grpc"
++
++slurm:
++  time_limit: "00:30:00"
++
++model:
++  path: "qwen3-0.6b"
++  container: "vllm"
++  precision: "bf16"
++
++resources:
++  gpu_type: "h100"
++  gpus_per_node: 8
++frontend:
++  type: smg
++  container_image: smg
++  enable_multiple_frontends: false
++
++engine:
++  type: vllm
++  connector: nixl
++roles:
++  prefill:
++    nodes: 1
++    workers: 1
++    gpus: 1
++    env:
++      PYTHONUNBUFFERED: "1"
++    args:
++      served-model-name: "Qwen/Qwen3-0.6B"
++      grpc: true
++      tensor-parallel-size: 1
++      gpu-memory-utilization: 0.5
++      max-model-len: 4096
++  decode:
++    nodes: colocate
++    workers: 1
++    gpus: 1
++    env:
++      PYTHONUNBUFFERED: "1"
++    args:
++      served-model-name: "Qwen/Qwen3-0.6B"
++      grpc: true
++      tensor-parallel-size: 1
++      gpu-memory-utilization: 0.5
++      max-model-len: 4096
++
++benchmark:
++  type: "sa-bench"
++  isl: 128
++  osl: 128
++  concurrencies: "4x8"
+diff --git a/mkdocs.yml b/mkdocs.yml
+index 2467fda1..a6cde333 100644
+--- a/mkdocs.yml
++++ b/mkdocs.yml
+@@ -59,6 +59,8 @@ nav:
+       - Architecture: architecture.md
+       - SGLang Router: sglang-router.md
+       - vLLM Router: vllm-router.md
++      - Shepherd Model Gateway: smg.md
++      - llm-d Router: llm-d.md
+       - TileRT: tilert.md
+       - Mooncake KV Store: mooncake-kv-store.md
+       - Services: services.md
+diff --git a/src/srtctl/backends/AGENTS.md b/src/srtctl/backends/AGENTS.md
+index b306d600..d8e8eb4a 100644
+--- a/src/srtctl/backends/AGENTS.md
++++ b/src/srtctl/backends/AGENTS.md
+@@ -17,6 +17,8 @@ Rules for `src/srtctl/backends/`. Every consumer asks a backend through `Backend
+    - `failover` / `get_failover_environment(...)` - shadow engine recovery; `None` / `{}` without it
+    - `should_set_visible_devices()` - `True` unless the engine takes its devices on the command line; the variable is the cluster's `visible_devices_env`
+    - `get_served_model_name(default)`
++   - `native_metrics_path` - where the engine's own OpenAI server serves Prometheus text (`/metrics`, trtllm-serve `/prometheus/metrics`)
++   - `is_grpc_mode(mode)` - whether the mode's workers serve gRPC; static routers advertise `grpc://` from it. `False` for an HTTP-only engine
+ 3. Export from `backends/__init__.py`
+ 4. Add polymorphic deserialization in `BackendConfigField` in `schema.py`
+ 
+diff --git a/src/srtctl/backends/atom.py b/src/srtctl/backends/atom.py
+index 60659222..f4e9ebe1 100644
+--- a/src/srtctl/backends/atom.py
++++ b/src/srtctl/backends/atom.py
+@@ -42,6 +42,7 @@ class AtomProtocol:
+     """Launch ``atom.entrypoints.openai_server`` on ROCm workers."""
+ 
+     type: Literal["atom"] = "atom"
++    native_metrics_path: ClassVar[str] = "/metrics"
+     prefill_environment: dict[str, str] = field(default_factory=dict)
+     decode_environment: dict[str, str] = field(default_factory=dict)
+     aggregated_environment: dict[str, str] = field(default_factory=dict)
+@@ -81,6 +82,10 @@ class AtomProtocol:
+     def get_process_environment(self, process: Process) -> dict[str, str]:
+         return {}
+ 
++    def is_grpc_mode(self, mode: str) -> bool:
++        """ATOM workers serve HTTP only."""
++        return False
++
+     def get_served_model_name(self, default: str) -> str:
+         """The name ATOM serves: a role's ``served-model-name``, else its literal ``--model``."""
+         if self.atom_config:
+diff --git a/src/srtctl/backends/base.py b/src/srtctl/backends/base.py
+index 538cf9e0..adc202fc 100644
+--- a/src/srtctl/backends/base.py
++++ b/src/srtctl/backends/base.py
+@@ -8,7 +8,7 @@ Base types and protocols for backend configurations.
+ from collections.abc import Sequence
+ from dataclasses import dataclass
+ from enum import Enum
+-from typing import TYPE_CHECKING, Any, Optional, Protocol
++from typing import TYPE_CHECKING, Any, ClassVar, Optional, Protocol
+ 
+ from srtctl.ports import DYN_SYSTEM_PORT_BASE
+ 
+@@ -74,6 +74,11 @@ class BackendProtocol(Protocol):
+         """Backend type identifier."""
+         ...
+ 
++    #: Path where the engine's own OpenAI server (a ``direct`` worker) serves
++    #: Prometheus text on its HTTP port. Frontends whose workers are the engine's
++    #: own server read it for the metrics URLs (``worker_metrics_path``).
++    native_metrics_path: ClassVar[str]
++
+     @property
+     def mooncake_kv_store(self) -> "MooncakeKVStoreConfig | VLLMMooncakeKVStoreConfig | None":
+         """The recipe's Mooncake KV store block, or None when the engine has none.
+@@ -207,3 +212,11 @@ class BackendProtocol(Protocol):
+     def get_served_model_name(self, default: str) -> str:
+         """Get served model name from backend config, or return default."""
+         ...
++
++    def is_grpc_mode(self, mode: str) -> bool:
++        """Whether the mode's workers serve gRPC instead of HTTP.
++
++        A static router reads it to advertise ``grpc://`` worker URLs. False for
++        an engine without a gRPC server.
++        """
++        ...
+diff --git a/src/srtctl/backends/mocker.py b/src/srtctl/backends/mocker.py
+index 826b243b..ae35d03d 100644
+--- a/src/srtctl/backends/mocker.py
++++ b/src/srtctl/backends/mocker.py
+@@ -86,6 +86,7 @@ class MockerProtocol:
+     """
+ 
+     type: Literal["mocker"] = "mocker"
++    native_metrics_path: ClassVar[str] = "/metrics"
+ 
+     # Simulation parameters
+     engine_type: str = "vllm"
+@@ -177,6 +178,10 @@ class MockerProtocol:
+         """
+         return {}
+ 
++    def is_grpc_mode(self, mode: str) -> bool:
++        """Mocker workers serve HTTP only."""
++        return False
++
+     def get_served_model_name(self, default: str) -> str:
+         """Get served model name — mocker uses default (model path basename)."""
+         return default
+diff --git a/src/srtctl/backends/sglang.py b/src/srtctl/backends/sglang.py
+index e7e0d618..ab03f432 100644
+--- a/src/srtctl/backends/sglang.py
++++ b/src/srtctl/backends/sglang.py
+@@ -136,6 +136,7 @@ class SGLangProtocol:
+     """
+ 
+     type: Literal["sglang"] = "sglang"
++    native_metrics_path: ClassVar[str] = "/metrics"
+     gpu_type: str | None = None
+ 
+     # Environment variables per mode
+diff --git a/src/srtctl/backends/tilert.py b/src/srtctl/backends/tilert.py
+index a2a164fe..f09f376d 100644
+--- a/src/srtctl/backends/tilert.py
++++ b/src/srtctl/backends/tilert.py
+@@ -36,6 +36,7 @@ class TileRTProtocol:
+     """Launch TileRT's decode server with recipe-owned model and transport settings."""
+ 
+     type: Literal["tilert"] = "tilert"
++    native_metrics_path: ClassVar[str] = "/metrics"
+     served_model_name: str | None = None
+     prefill_environment: dict[str, str] = field(default_factory=dict)
+     decode_environment: dict[str, str] = field(default_factory=dict)
+@@ -67,6 +68,10 @@ class TileRTProtocol:
+     def fatal_log_patterns(self, mode: str) -> tuple[str, ...]:
+         return ()
+ 
++    def is_grpc_mode(self, mode: str) -> bool:
++        """TileRT workers serve HTTP only."""
++        return False
++
+     def get_served_model_name(self, default: str) -> str:
+         return self.served_model_name or default
+ 
+diff --git a/src/srtctl/backends/trtllm.py b/src/srtctl/backends/trtllm.py
+index 41a7ce98..987a5f2d 100644
+--- a/src/srtctl/backends/trtllm.py
++++ b/src/srtctl/backends/trtllm.py
+@@ -74,6 +74,9 @@ class TRTLLMProtocol:
+     """
+ 
+     type: Literal["trtllm"] = "trtllm"
++    # trtllm-serve serves Prometheus text at /prometheus/metrics (mounted when
++    # return_perf_metrics is true); its /metrics route is JSON iteration stats.
++    native_metrics_path: ClassVar[str] = "/prometheus/metrics"
+ 
+     prefill_environment: dict[str, str] = field(default_factory=dict)
+     decode_environment: dict[str, str] = field(default_factory=dict)
+@@ -265,6 +268,10 @@ class TRTLLMProtocol:
+         """
+         return {}
+ 
++    def is_grpc_mode(self, mode: str) -> bool:
++        """TRT-LLM workers serve HTTP only."""
++        return False
++
+     def get_served_model_name(self, default: str) -> str:
+         """Get the configured served model name, or return default."""
+         return self.served_model_name or default
+diff --git a/src/srtctl/backends/vllm.py b/src/srtctl/backends/vllm.py
+index 36318f7b..5cd64be4 100644
+--- a/src/srtctl/backends/vllm.py
++++ b/src/srtctl/backends/vllm.py
+@@ -13,7 +13,7 @@ from __future__ import annotations
+ import builtins
+ import json
+ import logging
+-from collections.abc import Sequence
++from collections.abc import Mapping, Sequence
+ from dataclasses import dataclass as stdlib_dataclass
+ from dataclasses import field, replace
+ from pathlib import Path
+@@ -340,6 +340,7 @@ class VLLMProtocol:
+     """
+ 
+     type: Literal["vllm"] = "vllm"
++    native_metrics_path: ClassVar[str] = "/metrics"
+ 
+     # Environment variables per mode
+     prefill_environment: dict[str, str] = field(default_factory=dict)
+@@ -549,6 +550,32 @@ class VLLMProtocol:
+         """The connector table row for a mode; None for no connector or a raw JSON ``--kv-transfer-config``."""
+         return kv_connector_row(self.connector_for_mode(mode))
+ 
++    def kv_connector_class(self, mode: WorkerMode) -> str | None:
++        """The vLLM connector class a mode's workers run: ``kv_connector`` of their ``--kv-transfer-config``.
++
++        A ``kv-transfer-config`` written in the role's args wins, as it does on the
++        command line; otherwise the mode's connector (a table row or raw JSON).
++        None when the mode runs no connector.
++        """
++        explicit = next(
++            (
++                value
++                for key, value in self.get_config_for_mode(mode).items()
++                if normalize_vllm_config_key(key) == "kv-transfer-config"
++            ),
++            None,
++        )
++        if explicit is not None:
++            payload = explicit if isinstance(explicit, Mapping) else json.loads(str(explicit))
++            return payload.get("kv_connector")
++        row = self.kv_connector_for_mode(mode)
++        if row is not None:
++            return row.kv_connector
++        connector = self.connector_for_mode(mode)
++        if not connector or connector.lower() in ("null", "none"):
++            return None
++        return json.loads(connector).get("kv_connector")
++
+     def discovers_workers(self) -> bool:
+         """Whether the prefill/decode workers register with the router over its discovery endpoint.
+ 
+@@ -709,6 +736,11 @@ class VLLMProtocol:
+         filename = "mooncake_store_config_gpu" + "-".join(map(str, gpu_ids)) + ".json"
+         return filename, payload
+ 
++    def is_grpc_mode(self, mode: WorkerMode) -> bool:
++        """``roles.<role>.args.grpc: true`` renders ``vllm serve --grpc`` (served by smg-grpc-servicer)."""
++        config = self.get_config_for_mode(mode)
++        return any(normalize_vllm_config_key(key) == "grpc" and value is True for key, value in config.items())
++
+     def get_served_model_name(self, default: str) -> str:
+         """Get served model name from vLLM config, or return default."""
+         if self.vllm_config:
+@@ -987,9 +1019,10 @@ class VLLMProtocol:
+     ) -> list[Process]:
+         """Convert endpoints to processes.
+ 
+-        Dynamo DP+EP mode uses the configured per-GPU or per-node process layout.
+-        For direct vLLM aggregate jobs, `vllm serve` manages local DP ranks from
+-        one process, so keep the standard one-process-per-node topology.
++        Dynamo DP+EP mode and routers that expand node-local DP pools use the
++        configured per-GPU or per-node process layout. Any other direct worker is
++        one `vllm serve` that manages its DP ranks itself (headless on the other
++        nodes), so it keeps the standard topology: one API on the leader node.
+         For standard TP mode, creates one process per node. Every process then
+         gets the listeners its KV connector needs from the allocator (see
+         ``_with_connector_ports``).
+@@ -998,9 +1031,10 @@ class VLLMProtocol:
+         from srtctl.frontends import get_frontend
+ 
+         allocator = port_allocator_for(port_allocator, base_sys_port)
+-        if get_frontend(frontend_type).worker_api_port("agg") == "public":
+-            # The worker is the public endpoint: one `vllm serve` per node owns
+-            # its local DP ranks, so the standard topology applies.
++        frontend = get_frontend(frontend_type)
++        if frontend.worker_launch == "direct" and not frontend.expands_node_local_dp:
++            # One `vllm serve` owns every DP rank of the endpoint, and only the
++            # leader serves the API, so the standard topology applies.
+             processes = endpoints_to_processes(endpoints, port_allocator=allocator, sidecar_grpc=dynamo_sidecar)
+         elif not any(self._is_dp_mode(ep.mode) for ep in endpoints):
+             # Standard TP mode: one process per node, or one per engine of the
+diff --git a/src/srtctl/cli/mixins/benchmark_stage.py b/src/srtctl/cli/mixins/benchmark_stage.py
+index a6f37ce2..1c26986a 100644
+--- a/src/srtctl/cli/mixins/benchmark_stage.py
++++ b/src/srtctl/cli/mixins/benchmark_stage.py
+@@ -740,7 +740,7 @@ class BenchmarkStageMixin:
+                 (not self.config.dynamo.sidecar and backend.dynamo_metrics_flags) or backend.publish_events_and_metrics
+             )
+         )
+-        metrics_path = frontend.metrics_path
++        metrics_path = frontend.worker_metrics_path(backend)
+         if logical_workers_only:
+             # Sidecars use native worker commands, so publish_metrics does not
+             # control their existing logical-worker URL discovery. Their native
+@@ -763,7 +763,7 @@ class BenchmarkStageMixin:
+         elif frontend.worker_launch == "direct":
+             # Every rank the frontend says serves metrics. trtllm-serve mounts its
+             # Prometheus route only when the engine runs with return_perf_metrics
+-            # (expand_trtllm_serve_defaults sets it on every trtllm_serve recipe;
++            # (expand_trtllm_serve_defaults sets it on every direct-worker recipe;
+             # an explicit false opts out), so gate each worker on its own engine
+             # config -- publish_events_and_metrics is a dynamo.trtllm flag that
+             # never reaches a trtllm-serve worker.
+diff --git a/src/srtctl/cli/mixins/service_stage.py b/src/srtctl/cli/mixins/service_stage.py
+index 9497f145..bd1a5a20 100644
+--- a/src/srtctl/cli/mixins/service_stage.py
++++ b/src/srtctl/cli/mixins/service_stage.py
+@@ -143,7 +143,8 @@ class ServiceStageMixin:
+ 
+     def service_instances(self, service: ServiceConfig) -> list[tuple[str, Process | None]]:
+         """The instances a service launches: ``(node, None)`` per placed node, or under
+-        ``placement.per: worker`` ``(node, process)`` per engine worker on those nodes.
++        ``placement.per: worker`` ``(node, process)`` per engine worker on those nodes
++        that the kind attaches to (``ServiceKind.attaches_to``).
+ 
+         A worker's instance is attached to its engine 0 process (a worker with shadow
+         engines has several processes on a node; the sidecar serves them all).
+@@ -155,12 +156,14 @@ class ServiceStageMixin:
+             return [(node, None) for node in nodes]
+         where = service.effective_placement
+         order = {node: i for i, node in enumerate(nodes)}
++        kind = get_service_kind(service.type)
+         attached = [
+             process
+             for process in self.backend_processes
+             if process.node in order
+             and getattr(process, "engine_id", 0) == 0
+             and (where == "workers" or process.endpoint_mode == where)
++            and kind.attaches_to(process)
+         ]
+         attached.sort(key=lambda p: (order[p.node], p.endpoint_index, p.node_rank))
+         return [(process.node, process) for process in attached]
+diff --git a/src/srtctl/cli/mixins/telemetry_stage.py b/src/srtctl/cli/mixins/telemetry_stage.py
+index 65d44de4..c4280b70 100644
+--- a/src/srtctl/cli/mixins/telemetry_stage.py
++++ b/src/srtctl/cli/mixins/telemetry_stage.py
+@@ -551,6 +551,14 @@ class TelemetryStageMixin:
+             return None
+         return get_frontend(self.config.frontend.type).frontend_metrics_port(self.config.frontend.args)
+ 
++    def _worker_metrics_path(self) -> str:
++        """Path the workers serve Prometheus metrics at; a services-only job has no workers to scrape."""
++        from srtctl.frontends import FRONTEND_NONE, get_frontend
++
++        if self.config.frontend.type == FRONTEND_NONE:
++            return "/metrics"
++        return get_frontend(self.config.frontend.type).worker_metrics_path(self.config.backend)
++
+     def _service_metrics_targets(self) -> list[ServiceMetricsTarget]:
+         """One tachometer target per node for every service that serves metrics.
+ 
+@@ -628,6 +636,7 @@ class TelemetryStageMixin:
+                 tachometer=tachometer,
+                 frontend_type=self.config.frontend.type,
+                 frontend_metrics_port=self._frontend_metrics_port(),
++                worker_metrics_path=self._worker_metrics_path(),
+                 service_targets=[*self._service_metrics_targets(), *self._power_dcgm_targets()],
+             )
+         )
+diff --git a/src/srtctl/core/AGENTS.md b/src/srtctl/core/AGENTS.md
+index f0afde74..32e42896 100644
+--- a/src/srtctl/core/AGENTS.md
++++ b/src/srtctl/core/AGENTS.md
+@@ -4,7 +4,7 @@ Rules for `src/srtctl/core/` (schema, runtime, topology, processes, health). Sta
+ 
+ ## Ports
+ 
+-Fixed ports are constants in `src/srtctl/ports.py`. Every port a worker process binds is a `PortKind` in the same module (`name`, `base`, `stride`, `per_node`) and is handed out by `NodePortAllocator.next(kind, node, size)` in `src/srtctl/core/topology.py`: per-node counters for listeners only bound on that node (`HTTP_PORTS`, `BOOTSTRAP_PORTS`, `DP_RPC_PORTS`, `DIST_INIT_PORTS`) and global counters for side channels peers address (`SYS_PORTS`, `KV_EVENTS_PORTS`, `NIXL_PORTS`, `KVBM_ZMQ_PORTS`, `NCCL_PORTS`, `VLLM_SCAN_PORTS`, `MORIIO_HANDSHAKE_PORTS`, `MORIIO_NOTIFY_PORTS`, `TRTLLM_DIST_INIT_PORTS`, `SIDECAR_GRPC_PORTS`). `size > 1` reserves a block when the engine adds a rank offset to the port it is given (MoRI-IO adds the local DP and TP rank to its notify base). `endpoints_to_processes` allocates the generic kinds and stores them on `Process`; a backend adds its engine-specific kinds with `dataclasses.replace` on the way out (SGLang `nccl_port` and `dist_init_port`, vLLM `vllm_scan_port` or, for a discovery connector, `moriio_handshake_port` and `moriio_notify_port`, TRT-LLM `trtllm_dist_init_port`). `do_sweep` builds the one allocator per job, seeding the sidecar gRPC base from `dynamo.sidecar_port`.
++Fixed ports are constants in `src/srtctl/ports.py`. Every port a worker process binds is a `PortKind` in the same module (`name`, `base`, `stride`, `per_node`) and is handed out by `NodePortAllocator.next(kind, node, size)` in `src/srtctl/core/topology.py`: per-node counters for listeners only bound on that node (`HTTP_PORTS`, `BOOTSTRAP_PORTS`, `DP_RPC_PORTS`, `DIST_INIT_PORTS`) and global counters for side channels peers address (`SYS_PORTS`, `KV_EVENTS_PORTS`, `NIXL_PORTS`, `KVBM_ZMQ_PORTS`, `NCCL_PORTS`, `VLLM_SCAN_PORTS`, `MORIIO_HANDSHAKE_PORTS`, `MORIIO_NOTIFY_PORTS`, `TRTLLM_DIST_INIT_PORTS`, `SIDECAR_GRPC_PORTS`); `PROXY_PORTS` is per node and is allocated after the backends by `worker_processes` (`core/worker_backends.py`), for the routable workers of the modes the frontend proxies (`Frontend.proxied_worker_modes`). `size > 1` reserves a block when the engine adds a rank offset to the port it is given (MoRI-IO adds the local DP and TP rank to its notify base). `endpoints_to_processes` allocates the generic kinds and stores them on `Process`; a backend adds its engine-specific kinds with `dataclasses.replace` on the way out (SGLang `nccl_port` and `dist_init_port`, vLLM `vllm_scan_port` or, for a discovery connector, `moriio_handshake_port` and `moriio_notify_port`, TRT-LLM `trtllm_dist_init_port`). `do_sweep` builds the one allocator per job, seeding the sidecar gRPC base from `dynamo.sidecar_port`.
+ 
+ Rules that follow: a new listener is a new `PortKind` plus a `Process` field, allocated in the topology builder, never `some_base + (sys_port - DYN_SYSTEM_PORT_BASE)` or any other arithmetic on another port at command-build time. Consumers read the field; a `None` means the topology was built without that kind, and a consumer that needs it raises rather than guessing. A worker's own address is `get_hostname_ip(node, runtime.network_interface)`, not upstream's interface guess. Fixed scan bases such as `VLLM_PORT` exist only to keep co-located `get_open_port()` scans apart; if a connector allocates inside forked children, leave the base unset so the kernel assigns ports. Frontends bind `FRONTEND_PUBLIC_PORT` (8000), or `FRONTEND_INTERNAL_PORT` (8180) behind nginx when `enable_multiple_frontends` is set. Service ports are `ServiceKind` defaults overridden by `options`. `tests/test_port_allocator.py` asserts over every example recipe that no two processes on a node share a port and global kinds never repeat.
+ 
+diff --git a/src/srtctl/core/config.py b/src/srtctl/core/config.py
+index ac883cd8..7f5e6315 100755
+--- a/src/srtctl/core/config.py
++++ b/src/srtctl/core/config.py
+@@ -865,18 +865,24 @@ def expand_trtllm_serve_defaults(cfg: dict) -> dict:
+     default every trtllm-serve worker endpoint answers HTTP 404 and the capture
+     silently has no worker-level data.
+ 
+-    Applies to every ``frontend.type: trtllm_serve`` recipe with a TRT-LLM
+-    backend, independent of ``observability.enabled``. The engine sections for
+-    the modes the recipe uses (prefill + decode for a disaggregated
++    Applies to every recipe whose frontend launches ``direct`` workers
++    (``trtllm_serve``, or a router such as ``smg``) with a TRT-LLM backend,
++    independent of ``observability.enabled``. The engine sections for the modes
++    the recipe uses (prefill + decode for a disaggregated
+     ``resources`` block, ``aggregated`` otherwise) are created when absent, so a
+     recipe with no ``trtllm_config`` gets the default too. Every write is a
+     ``setdefault``: an explicit ``return_perf_metrics: false`` in the recipe
+     wins, but is reported loudly. Mutates ``cfg`` in place and returns it.
+     """
+     from srtctl.core.schema import TRTLLM_SERVE_ENGINE_DEFAULTS
++    from srtctl.frontends import FRONTEND_NONE, get_frontend, list_frontend_types
+ 
+     frontend = cfg.get("frontend")
+-    if not isinstance(frontend, dict) or frontend.get("type") != "trtllm_serve":
++    frontend_type = frontend.get("type") if isinstance(frontend, dict) else None
++    # An unset type is Dynamo; an unknown one is reported by schema validation.
++    if frontend_type in (None, FRONTEND_NONE) or frontend_type not in list_frontend_types():
++        return cfg
++    if get_frontend(frontend_type).worker_launch != "direct":
+         return cfg
+     backend = cfg.get("backend")
+     if not isinstance(backend, dict) or backend.get("type", "sglang") != "trtllm":
+@@ -886,10 +892,11 @@ def expand_trtllm_serve_defaults(cfg: dict) -> dict:
+     opted_out = [mode for mode, section in sections.items() if section.get("return_perf_metrics") is False]
+     if opted_out:
+         logger.warning(
+-            "frontend.type: trtllm_serve with return_perf_metrics: false on %s — those "
++            "frontend.type: %s with return_perf_metrics: false on %s — those "
+             "trtllm-serve workers will NOT mount /prometheus/metrics (HTTP 404), so the "
+             "Tachometer backend_* endpoints and the per-request Prometheus histograms "
+             "will be empty for them. Remove the line to keep the default.",
++            frontend_type,
+             ", ".join(opted_out),
+         )
+     return cfg
+diff --git a/src/srtctl/core/schema.py b/src/srtctl/core/schema.py
+index 915fcbc5..649aa97e 100755
+--- a/src/srtctl/core/schema.py
++++ b/src/srtctl/core/schema.py
+@@ -2140,7 +2140,9 @@ class FrontendConfig:
+ 
+     Attributes:
+         type: Frontend type - "dynamo" (default); "sglang-router" (SGLang Model
+-            Gateway), "vllm-router", "atomesh", and "tilert-router" (static routers); "sglang", "vllm", and
++            Gateway), "vllm-router", "smg" (Shepherd Model Gateway, any backend), "llm-d"
++            (llm-d Endpoint Picker behind Envoy, vLLM), "atomesh", and
++            "tilert-router" (static routers); "sglang", "vllm", and
+             "trtllm_serve" (direct: the single aggregate worker binds the public
+             port, no router process); "none" (services-only job: no router, no
+             OpenAI endpoint, no worker-count health gate; requires no engine
+@@ -2173,6 +2175,13 @@ class FrontendConfig:
+             writes this mapping under the top-level ``worker_selection`` key in a
+             generated router policy YAML and passes it to the Dynamo frontend via
+             ``--router-policy-config``.
++        epp_config: llm-d Endpoint Picker configuration (``EndpointPickerConfig``:
++            ``plugins``, ``schedulingProfiles``, ...) for ``frontend.type: llm-d``.
++            srtctl writes it to a file with the ``file-discovery`` plugin and
++            ``dataLayer.discovery`` added, so the EPP reads the job's workers from
++            the endpoints file srtctl renders. Required for prefill/decode jobs
++            (the scheduler's P/D profiles); omitted, an aggregate job runs the
++            EPP's built-in default profile.
+         args: CLI arguments passed to the frontend/router process
+         env: Environment variables for frontend processes
+         container_image: Optional router-specific image. Static routers use the
+@@ -2192,6 +2201,7 @@ class FrontendConfig:
+     nginx_session_affinity_header: str = "X-Dynamo-Session-ID"
+     nginx_keepalive_timeout: str = "600s"
+     worker_selection: dict[str, Any] | None = None
++    epp_config: dict[str, Any] | None = None
+     args: dict[str, Any] | None = None
+     env: dict[str, str] | None = None
+     container_image: str | None = None
+diff --git a/src/srtctl/core/telemetry.py b/src/srtctl/core/telemetry.py
+index 5fd64a54..900d833d 100644
+--- a/src/srtctl/core/telemetry.py
++++ b/src/srtctl/core/telemetry.py
+@@ -69,6 +69,7 @@ def generate_tachometer_config(
+     tachometer: TachometerConfig,
+     frontend_type: str = "dynamo",
+     frontend_metrics_port: int | None = None,
++    worker_metrics_path: str = "/metrics",
+     service_targets: Sequence[ServiceMetricsTarget] = (),
+ ) -> str:
+     """Generate Tachometer TOML from the worker and frontend topology plus the services' metrics.
+@@ -104,8 +105,9 @@ def generate_tachometer_config(
+     """
+     from srtctl.frontends import FRONTEND_NONE, get_frontend
+ 
+-    # The frontend says which rank serves metrics on which port and at what path;
+-    # a services-only job has no frontend and no worker processes.
++    # The frontend says which rank serves metrics on which port, and at what path
++    # (``worker_metrics_path``, resolved by the caller with the backend); a
++    # services-only job has no frontend and no worker processes.
+     frontend = None if frontend_type == FRONTEND_NONE else get_frontend(frontend_type)
+     metrics_path = frontend.metrics_path if frontend is not None else "/metrics"
+     endpoints: list[TelemetryEndpoint] = []
+@@ -129,7 +131,7 @@ def generate_tachometer_config(
+         if port is None:
+             continue
+         node_ip = get_hostname_ip(process.node, runtime.network_interface)
+-        url = f"http://{url_host(node_ip)}:{port}{metrics_path}"
++        url = f"http://{url_host(node_ip)}:{port}{worker_metrics_path}"
+         node_metadata = {
+             "hostname": process.node,
+             "worker_index": str(process.endpoint_index),
+diff --git a/src/srtctl/core/topology.py b/src/srtctl/core/topology.py
+index d6897331..16e1ae24 100644
+--- a/src/srtctl/core/topology.py
++++ b/src/srtctl/core/topology.py
+@@ -165,6 +165,8 @@ class Process:
+             their own ports and their own srun step.
+         kvbm_zmq_port: KVBM leader ZMQ pub port (ack is the next port); the leader's is used
+         sidecar_grpc_port: Dynamo sidecar gRPC listener, allocated when the job runs sidecars
++        proxy_port: listener of the proxy the router sends this routable worker's traffic
++            through (llm-d's P/D sidecar), allocated when the frontend proxies its mode
+         nccl_port: SGLang local TP rendezvous port, one per server process
+         dist_init_port: SGLang multi-node dist-init port; the same value on every process of an endpoint
+         vllm_scan_port: first port of this vLLM process's private ``get_open_port()`` scan range
+@@ -192,6 +194,7 @@ class Process:
+     engine_id: int = 0
+     kvbm_zmq_port: int | None = None
+     sidecar_grpc_port: int | None = None
++    proxy_port: int | None = None
+     nccl_port: int | None = None
+     dist_init_port: int | None = None
+     vllm_scan_port: int | None = None
+diff --git a/src/srtctl/core/worker_backends.py b/src/srtctl/core/worker_backends.py
+index de433e19..49462c9d 100644
+--- a/src/srtctl/core/worker_backends.py
++++ b/src/srtctl/core/worker_backends.py
+@@ -11,11 +11,12 @@ its assigned endpoints and construction of commands for those processes.
+ from __future__ import annotations
+ 
+ from collections.abc import Sequence
++from dataclasses import replace
+ from functools import partial
+ from typing import TYPE_CHECKING
+ 
+ from srtctl.core.topology import Endpoint, NodePortAllocator, Process, allocate_endpoints
+-from srtctl.ports import SIDECAR_GRPC_PORTS
++from srtctl.ports import PROXY_PORTS, SIDECAR_GRPC_PORTS
+ 
+ if TYPE_CHECKING:
+     from srtctl.backends import BackendConfig
+@@ -65,10 +66,26 @@ def worker_processes(
+         )
+ 
+     if not config.has_role_backends:
+-        return expand(config.backend, endpoints)
+-    processes: list[Process] = []
+-    for role in ("prefill", "decode", "agg"):
+-        selected = [endpoint for endpoint in endpoints if endpoint.mode == role]
+-        if selected:
+-            processes.extend(expand(config.backend_for_role(role), selected))
+-    return processes
++        processes = expand(config.backend, endpoints)
++    else:
++        processes = []
++        for role in ("prefill", "decode", "agg"):
++            selected = [endpoint for endpoint in endpoints if endpoint.mode == role]
++            if selected:
++                processes.extend(expand(config.backend_for_role(role), selected))
++    return with_proxy_ports(config, processes, allocator)
++
++
++def with_proxy_ports(config: SrtConfig, processes: list[Process], allocator: NodePortAllocator) -> list[Process]:
++    """Give every routable worker of a mode the frontend proxies the listener its proxy binds."""
++    from srtctl.frontends import FRONTEND_NONE, get_frontend
++
++    if config.frontend.type == FRONTEND_NONE:
++        return processes
++    proxied = get_frontend(config.frontend.type).proxied_worker_modes(config)
++    return [
++        replace(process, proxy_port=allocator.next(PROXY_PORTS, process.node))
++        if process.http_port > 0 and process.endpoint_mode in proxied
++        else process
++        for process in processes
++    ]
+diff --git a/src/srtctl/frontends/AGENTS.md b/src/srtctl/frontends/AGENTS.md
+index 745f4369..890b993c 100644
+--- a/src/srtctl/frontends/AGENTS.md
++++ b/src/srtctl/frontends/AGENTS.md
+@@ -4,17 +4,17 @@ Rules for `src/srtctl/frontends/`. The Design Rules in the root `CLAUDE.md` appl
+ 
+ ## Frontends and readiness
+ 
+-The frontend is the process that owns the public OpenAI port (`FRONTEND_PUBLIC_PORT`) and decides when the job is ready. Implementations live under `src/srtctl/frontends/`, register with `@register_frontend("<type>")`, and are imported from the package `__init__`; `frontend.type` resolves through that registry (`get_frontend`, `list_frontend_types`) and nowhere else. Registered today: `dynamo` (etcd/NATS discovery), `sglang-router` and `vllm-router` (static URL routers, both built on `StaticRouterFrontend`), `trtllm_serve` (direct aggregate or the disaggregated orchestrator), `sglang` and `vllm` (one direct worker owns the port); `none` is the services-only job with no implementation and no gate.
++The frontend is the process that owns the public OpenAI port (`FRONTEND_PUBLIC_PORT`) and decides when the job is ready. Implementations live under `src/srtctl/frontends/`, register with `@register_frontend("<type>")`, and are imported from the package `__init__`; `frontend.type` resolves through that registry (`get_frontend`, `list_frontend_types`) and nowhere else. Registered today: `dynamo` (etcd/NATS discovery), `sglang-router`, `vllm-router` and `smg` (static URL routers built on `StaticRouterFrontend`; `smg` pairs with any backend), `trtllm_serve` (direct aggregate or the disaggregated orchestrator), `sglang` and `vllm` (one direct worker owns the port); `none` is the services-only job with no implementation and no gate.
+ 
+ `FrontendProtocol` hooks: `required_backend` and `validate(config)` (recipe rules, run by `SrtConfig._validate_frontend` at load so dry-run catches them; raise `ValueError` with the user-facing message), `health_endpoint` and `parse_health` (readiness), `get_backend_health_urls` (second gate: every advertised worker URL must answer 200 before traffic), `start_frontends` (launch on `topology.frontend_nodes`, one `ManagedProcess` per node with a `step_name`), `get_frontend_args_list` (`frontend.args` to CLI). The schema knows no individual frontend: pairing and per-type rules come from these two members.
+ 
+-Two base classes cover the two ways a frontend learns about its workers. `DynamicFrontend` (`frontends/dynamic_frontend.py`) is for frontends whose workers register themselves over a discovery plane: it fronts any engine, needs no per-worker URL gate, and no worker is the public endpoint; Dynamo is its only implementation. A router binary that can also take static URLs (vLLM Router's ZMQ discovery mode) is a mode of a static router, not a dynamic frontend. `StaticRouterFrontend` (`frontends/static_router.py`) is the base for routers that take worker URLs on the command line. Subclasses set `executable`, `pd_flag`, `process_name` and override only what differs: `worker_scheme` (http or grpc per mode), `worker_bootstrap_port` (the P/D port advertised next to a prefill URL), `resolve_worker_host`, `get_managed_frontend_args` (arguments derived from the allocated topology; a conflicting user value raises instead of being overwritten), `build_bash_preamble`, `build_router_command`, `start_process` (test seam). `collect_workers` treats a positive `Process.http_port` as the definition of a routable worker.
++Two base classes cover the two ways a frontend learns about its workers. `DynamicFrontend` (`frontends/dynamic_frontend.py`) is for frontends whose workers register themselves over a discovery plane: it fronts any engine, needs no per-worker URL gate, and no worker is the public endpoint; Dynamo is its only implementation. A router binary that can also take static URLs (vLLM Router's ZMQ discovery mode) is a mode of a static router, not a dynamic frontend. `StaticRouterFrontend` (`frontends/static_router.py`) is the base for routers that take worker URLs on the command line. Subclasses set `executable`, `pd_flag`, `process_name` and override only what differs: `worker_scheme` (http, or grpc when `backend.is_grpc_mode(mode)`; the base answers that for every backend), `worker_bootstrap_port` (the P/D port advertised next to a prefill URL), `resolve_worker_host`, `get_managed_frontend_args` (arguments derived from the allocated topology; a conflicting user value raises instead of being overwritten), `build_bash_preamble`, `build_router_command`, `start_process` (test seam). `collect_workers` treats a positive `Process.http_port` as the definition of a routable worker.
+ 
+ Readiness runs in `BenchmarkStageMixin._wait_for_service_ready`: `wait_for_model` owns timing, abort, and progress logging, and calls the frontend's `probe_ready(host, port, n_prefill, n_decode, config)` once per poll with counts from the frontend's `health_expectations(config, processes)`; then `get_backend_health_urls` are polled with `wait_for_http_endpoints`. A probe raises `requests.RequestException` while the endpoint is down and otherwise returns a `WorkerHealthResult`. `core/health.py` has the three probe shapes to build on: `probe_json_health` (a JSON worker count through `parse_health`), `probe_http_ok` (a bare 200), `probe_direct_server` (`/health` then `/v1/models`). No frontend name appears in `wait_for_model` or `_get_health_expectations`.
+ 
+ The frontend also owns the worker shape, and backends read it instead of comparing names: `worker_launch` (`dynamo` workers register with the Dynamo runtime, `direct` workers are the engine's own server), `worker_api_port(mode)` (`public` when the worker is itself the endpoint and binds `runtime.frontend_port`, `allocated` when a router fronts it on `Process.http_port`), and `expands_node_local_dp` (vLLM Router expands per-node hybrid-LB pools, so the vLLM backend launches one API per node and refuses `per_gpu`). `build_worker_command` still takes `frontend_type` and resolves it through `get_frontend`; a new router mode is therefore one frontend override plus, at most, a new attribute on the protocol.
+ 
+-Which rank serves what is the frontend's call too, one method per consumer: `worker_metrics_port(process, runtime)` and `metrics_path` feed the tachometer scrape targets and the AIPerf metrics URLs (Dynamo: every rank on its system port; native servers: the leader or each routable pool on its HTTP port), `worker_endpoint_port(process, config, runtime)` feeds the `PREFILL_IPS`-style benchmark env (one per logical worker), `profiling_control_port` and `profiling_control_is_leader_only` feed iteration-triggered nsys control, `direct_endpoint_nodes(processes)` names the nodes whose worker is itself the public endpoint, and `worker_ready_port(process)` is what sequential endpoint start polls. `core/telemetry.py` and the benchmark stage contain no frontend-name checks; `BenchmarkStageMixin.frontend` is `None` for a services-only job.
++Which rank serves what is the frontend's call too, one method per consumer: `worker_metrics_port(process, runtime)` and `worker_metrics_path(backend)` feed the tachometer scrape targets and the AIPerf metrics URLs (a direct worker answers at `backend.native_metrics_path`; `metrics_path` is the router's own) (Dynamo: every rank on its system port; native servers: the leader or each routable pool on its HTTP port), `worker_endpoint_port(process, config, runtime)` feeds the `PREFILL_IPS`-style benchmark env (one per logical worker), `profiling_control_port` and `profiling_control_is_leader_only` feed iteration-triggered nsys control, `direct_endpoint_nodes(processes)` names the nodes whose worker is itself the public endpoint, and `worker_ready_port(process)` is what sequential endpoint start polls. `core/telemetry.py` and the benchmark stage contain no frontend-name checks; `BenchmarkStageMixin.frontend` is `None` for a services-only job.
+ 
+ Expected counts come from the frontend too: `health_expectations(config, processes)` returns `(prefill, decode, description)` in the units its endpoint reports. Aggregate workers count as decode; Dynamo counts vLLM DP registrations, vLLM Router counts the ranks it expands each URL into, everything else counts logical workers.
+ 
+diff --git a/src/srtctl/frontends/__init__.py b/src/srtctl/frontends/__init__.py
+index 1a0e055b..56606691 100644
+--- a/src/srtctl/frontends/__init__.py
++++ b/src/srtctl/frontends/__init__.py
+@@ -10,8 +10,10 @@ importing it from here is what makes ``frontend.type: <type>`` resolvable.
+ 
+ Supported frontend types:
+ - dynamo: Dynamo frontend with NATS/etcd communication
++- llm-d: llm-d Endpoint Picker behind Envoy, with the P/D sidecar on decode workers
+ - sglang: Direct sglang.launch_server for a single aggregate worker (no router)
+ - sglang-router: SGLang Model Gateway router in front of static workers
++- smg: Shepherd Model Gateway in front of any engine's static workers
+ - tilert-router: TileRT P/D router in front of vLLM prefill and TileRT decode
+ - trtllm_serve: Direct trtllm-serve worker or the disaggregated orchestrator
+ - vllm: Direct vLLM OpenAI server for aggregate jobs
+@@ -28,8 +30,10 @@ from srtctl.frontends.base import (
+ )
+ from srtctl.frontends.dynamic_frontend import DynamicFrontend
+ from srtctl.frontends.dynamo import DynamoFrontend
++from srtctl.frontends.llm_d import LLMDFrontend
+ from srtctl.frontends.sglang import SGLangRouterFrontend
+ from srtctl.frontends.sglang_direct import SGLangFrontend
++from srtctl.frontends.smg import SMGFrontend
+ from srtctl.frontends.tilert_router import TileRTRouterFrontend
+ from srtctl.frontends.trtllm_serve import TRTLLMServeFrontend
+ from srtctl.frontends.vllm import VLLMFrontend
+@@ -41,8 +45,10 @@ __all__ = [
+     "DynamicFrontend",
+     "DynamoFrontend",
+     "FrontendProtocol",
++    "LLMDFrontend",
+     "SGLangFrontend",
+     "SGLangRouterFrontend",
++    "SMGFrontend",
+     "TRTLLMServeFrontend",
+     "TileRTRouterFrontend",
+     "VLLMFrontend",
+diff --git a/src/srtctl/frontends/base.py b/src/srtctl/frontends/base.py
+index 1dec35a1..5eea2ea3 100644
+--- a/src/srtctl/frontends/base.py
++++ b/src/srtctl/frontends/base.py
+@@ -38,7 +38,8 @@ class FrontendProtocol(Protocol):
+        (``worker_launch``, ``worker_api_port``, ``expands_node_local_dp``)
+     3. Which rank serves metrics, an endpoint, or profiler control, and where
+        (``worker_metrics_port``, ``worker_endpoint_port``, ``profiling_control_port``,
+-       ``direct_endpoint_nodes``, ``worker_ready_port``, ``metrics_path``)
++       ``direct_endpoint_nodes``, ``worker_ready_port``, ``metrics_path``,
++       ``worker_metrics_path``)
+     4. How readiness is probed and counted (``probe_ready``, ``health_expectations``,
+        ``get_backend_health_urls``)
+     5. What it brings along (``implied_services``, ``frontend_metrics_port``)
+@@ -84,11 +85,19 @@ class FrontendProtocol(Protocol):
+         """
+         ...
+ 
+-    #: Path where this frontend's workers and router serve Prometheus metrics.
++    #: Path where this frontend's router (or its direct endpoint) serves Prometheus metrics.
+     metrics_path: ClassVar[str]
+ 
++    def worker_metrics_path(self, backend: Any) -> str:
++        """Path a worker serves Prometheus metrics at on ``worker_metrics_port``.
++
++        A Dynamo worker's system server answers ``/metrics`` for every engine; a
++        direct worker is the engine's own server, so ``backend.native_metrics_path``.
++        """
++        ...
++
+     def worker_metrics_port(self, process: "Process", runtime: "RuntimeContext") -> int | None:
+-        """Port on ``process.node`` serving Prometheus metrics at ``metrics_path`` for this rank.
++        """Port on ``process.node`` serving Prometheus metrics at ``worker_metrics_path`` for this rank.
+ 
+         ``None`` when the rank serves none: a follower of a native multi-node
+         server, or a layout the frontend does not scrape. Every rank of a Dynamo
+@@ -162,6 +171,15 @@ class FrontendProtocol(Protocol):
+         """Services this frontend needs that the recipe did not name (Dynamo: its discovery plane)."""
+         ...
+ 
++    def proxied_worker_modes(self, config: Any) -> frozenset[str]:
++        """Worker modes the router reaches through a per-worker proxy instead of the worker's own port.
++
++        Every routable worker of these modes gets ``Process.proxy_port`` from the
++        allocator (``core.worker_backends.worker_processes``); the frontend implies
++        the service that binds it (llm-d: its P/D sidecar on decode workers).
++        """
++        ...
++
+     def frontend_metrics_port(self, frontend_args: dict[str, Any] | None) -> int | None:
+         """Port of a Prometheus listener separate from the routing port, or ``None`` when metrics share it."""
+         ...
+diff --git a/src/srtctl/frontends/dynamic_frontend.py b/src/srtctl/frontends/dynamic_frontend.py
+index 73ebd73a..0bde38cd 100644
+--- a/src/srtctl/frontends/dynamic_frontend.py
++++ b/src/srtctl/frontends/dynamic_frontend.py
+@@ -43,6 +43,10 @@ class DynamicFrontend:
+     expands_node_local_dp: ClassVar[bool] = False
+     metrics_path: ClassVar[str] = "/metrics"
+ 
++    def worker_metrics_path(self, backend: Any) -> str:
++        """Every rank's Dynamo system server answers ``/metrics``, whatever the engine."""
++        return self.metrics_path
++
+     @property
+     def health_endpoint(self) -> str:
+         """The frontend reports its registered workers here; ``parse_health`` counts them."""
+@@ -86,6 +90,10 @@ class DynamicFrontend:
+         """The discovery plane the frontend needs; none unless the implementation brings one."""
+         return []
+ 
++    def proxied_worker_modes(self, config: Any) -> frozenset[str]:
++        """No worker sits behind a proxy."""
++        return frozenset()
++
+     def frontend_metrics_port(self, frontend_args: dict[str, Any] | None) -> int | None:
+         """Metrics share the routing port unless the implementation runs a separate listener."""
+         return None
+diff --git a/src/srtctl/frontends/llm_d.py b/src/srtctl/frontends/llm_d.py
+new file mode 100644
+index 00000000..e7c3a688
+--- /dev/null
++++ b/src/srtctl/frontends/llm_d.py
+@@ -0,0 +1,335 @@
++# SPDX-FileCopyrightText: Copyright (c) 2026 SemiAnalysis LLC. All rights reserved.
++# SPDX-License-Identifier: Apache-2.0
++
++"""llm-d router frontend (`frontend.type: llm-d`): the Endpoint Picker behind Envoy.
++
++llm-d routes with two processes on the router node. Envoy owns the public port
++and asks the Endpoint Picker (EPP) over ext_proc which worker each request goes
++to; the EPP answers with the ``x-gateway-destination-endpoint`` header and
++Envoy's ORIGINAL_DST cluster forwards there. For prefill/decode the EPP picks a
++decode endpoint and names the prefill worker in ``x-prefiller-host-port``; that
++decode endpoint is llm-d's P/D sidecar, a service this frontend implies on every
++routable decode worker (``services/llm_d_sidecar.py``).
++
++Without Kubernetes the EPP reads its workers from a file (the ``file-discovery``
++plugin), so srtctl is the registrar: once every worker answers ``/health`` it
++writes the endpoints file, the EPP configuration (the recipe's
++``frontend.epp_config`` plus the discovery plugin), and the Envoy configuration
++into the log directory, then starts the EPP and Envoy. The job is ready when
++Envoy's admin ``/ready`` answers and the EPP reports every endpoint ready
++(``llm_d_epp_ready_endpoints``: endpoints whose metrics it scrapes).
++
++Upstream, pinned: llm-d-router v0.11.0
++(https://github.com/llm-d/llm-d-router/tree/a5cbe600ebade00cf3e9885beaf2bfacddeabce1):
++``cmd/epp/runner/runner.go`` (``runWithFileDiscovery``),
++``pkg/epp/framework/plugins/datalayer/discovery/file``; the Envoy configuration
++follows llm-d's no-Kubernetes guide
++(https://github.com/llm-d/llm-d/blob/7fb84b0adf8e1d41eb2cef105fc1aafaf5a9b64f/guides/no-kubernetes-deployment/router/envoy/envoy.yaml).
++"""
++
++from __future__ import annotations
++
++import copy
++import logging
++import shlex
++import threading
++from pathlib import Path
++from typing import TYPE_CHECKING, Any, ClassVar
++
++import requests
++import yaml
++
++from srtctl.core.health import WorkerHealthResult
++from srtctl.frontends.base import numactl_prefix, register_frontend
++from srtctl.frontends.static_router import StaticRouterFrontend
++from srtctl.ports import (
++    LLM_D_ENVOY_ADMIN_PORT,
++    LLM_D_EPP_GRPC_PORT,
++    LLM_D_EPP_HEALTH_PORT,
++    LLM_D_EPP_METRICS_PORT,
++)
++from srtctl.services.config import ServiceConfig, ServicePlacementConfig
++from srtctl.services.implicit import EffectiveService
++from srtctl.services.llm_d_sidecar import LLM_D_SIDECAR_TYPE, sidecar_kv_connector
++
++if TYPE_CHECKING:
++    from srtctl.core.processes import ManagedProcess
++    from srtctl.core.runtime import RuntimeContext
++    from srtctl.core.topology import Process
++
++logger = logging.getLogger(__name__)
++
++# Pool the EPP serves; also the namespace of every endpoint in the endpoints file.
++POOL = "srtctl"
++DISCOVERY_PLUGIN = "srtctl-file-discovery"
++ENDPOINTS_FILE = "llm-d-endpoints.yaml"
++EPP_CONFIG_FILE = "llm-d-epp-config.yaml"
++ENVOY_CONFIG_FILE = "llm-d-envoy.yaml"
++ENVOY_ACCESS_LOG = "llm-d-envoy-access.log"
++# The EPP's role label (pkg/epp/framework/plugins/scheduling/filter/bylabel/roles.go):
++# prefill-filter and decode-filter select on it; an aggregate worker serves both.
++ROLE_LABEL = "llm-d.ai/role"
++ROLE_BY_MODE = {"prefill": "prefill", "decode": "decode", "agg": "both"}
++# Gauge of endpoints whose metrics the EPP scraped within its staleness window
++# (pkg/epp/metrics/llm_d_router_metrics.go).
++READY_ENDPOINTS_METRIC = "llm_d_epp_ready_endpoints"
++# EPP flags srtctl sets; frontend.args may not repeat them.
++_MANAGED_EPP_FLAGS = frozenset(
++    {"pool-name", "pool-namespace", "config-file", "config-text", "grpc-port", "grpc-health-port", "metrics-port"}
++)
++
++
++def _is_pd(config: Any) -> bool:
++    topology = config.resources
++    return topology.num_prefill > 0 and topology.num_decode > 0
++
++
++def _container_path(name: str) -> str:
++    """``log_dir/<name>`` as every container sees it (``log_dir`` is mounted at ``/logs``)."""
++    return str(Path("/logs") / name)
++
++
++def epp_config_document(epp_config: dict[str, Any] | None, endpoints_path: str) -> dict[str, Any]:
++    """The recipe's ``EndpointPickerConfig`` with srtctl's file discovery added.
++
++    ``dataLayer.discovery.pluginRef`` is the spelling both v0.10 and v0.11 accept
++    (v0.11 also reads ``discovery.endpoints.pluginRef``).
++    """
++    document: dict[str, Any] = {"apiVersion": "llm-d.ai/v1alpha1", "kind": "EndpointPickerConfig"}
++    document.update(copy.deepcopy(epp_config or {}))
++    document["plugins"] = [
++        *(document.get("plugins") or []),
++        {
++            "name": DISCOVERY_PLUGIN,
++            "type": "file-discovery",
++            # srtctl writes the file once, from the workers it launched.
++            "parameters": {"path": endpoints_path, "watchFile": False},
++        },
++    ]
++    document["dataLayer"] = {**(document.get("dataLayer") or {}), "discovery": {"pluginRef": DISCOVERY_PLUGIN}}
++    return document
++
++
++def envoy_config(listen_port: int, access_log: str) -> str:
++    """Envoy in front of the EPP: ext_proc to it on localhost, then ORIGINAL_DST to the endpoint it picked."""
++    from jinja2 import Environment, FileSystemLoader
++
++    templates = Environment(loader=FileSystemLoader(str(Path(__file__).parent.parent / "templates")))
++    return templates.get_template("llm-d-envoy.yaml.j2").render(
++        admin_port=LLM_D_ENVOY_ADMIN_PORT,
++        listen_port=listen_port,
++        access_log=access_log,
++        epp_port=LLM_D_EPP_GRPC_PORT,
++    )
++
++
++def parse_ready_endpoints(metrics_text: str) -> int | None:
++    """The EPP's ready-endpoint gauge from its Prometheus text, or None before it is published."""
++    total: float | None = None
++    for line in metrics_text.splitlines():
++        if line.startswith((f"{READY_ENDPOINTS_METRIC} ", f"{READY_ENDPOINTS_METRIC}{{")):
++            total = (total or 0.0) + float(line.rsplit(" ", 1)[1])
++    return None if total is None else int(total)
++
++
++@register_frontend("llm-d")
++class LLMDFrontend(StaticRouterFrontend):
++    """llm-d Endpoint Picker behind Envoy, in front of direct vLLM workers."""
++
++    type: ClassVar[str] = "llm-d"
++    required_backend: ClassVar[str | None] = "vllm"
++    executable: ClassVar[tuple[str, ...]] = ("epp",)
++    # The EPP takes prefill/decode from its scheduler configuration, not a flag.
++    pd_flag: ClassVar[str] = ""
++    process_name: ClassVar[str] = "llm-d"
++    # The endpoints file is written once, from workers that already answer /health.
++    wait_for_workers_before_start: ClassVar[bool] = True
++
++    def validate(self, config: Any) -> None:
++        frontend = config.frontend
++        if (
++            frontend.enable_multiple_frontends
++            and frontend.num_additional_frontends > 0
++            and config.engine_node_count > 1
++        ):
++            raise ValueError(
++                "frontend.type: llm-d runs one Endpoint Picker, which keeps its routing state in memory; "
++                "set frontend.enable_multiple_frontends: false (or num_additional_frontends: 0)"
++            )
++        topology = config.resources
++        for mode, count in (
++            ("prefill", topology.num_prefill),
++            ("decode", topology.num_decode),
++            ("agg", topology.num_agg),
++        ):
++            if count and config.backend_for_role(mode).is_grpc_mode(mode):
++                raise ValueError(f"frontend.type: llm-d routes HTTP workers; roles.{mode} serves gRPC")
++        epp_config = frontend.epp_config or {}
++        data_layer = epp_config.get("dataLayer") or {}
++        if "discovery" in data_layer or any(
++            plugin.get("type") == "file-discovery" for plugin in epp_config.get("plugins") or []
++        ):
++            raise ValueError(
++                "frontend.epp_config must not configure endpoint discovery: srtctl adds the file-discovery "
++                "plugin and dataLayer.discovery for the workers it launches"
++            )
++        if _is_pd(config):
++            if not epp_config.get("schedulingProfiles"):
++                raise ValueError(
++                    "frontend.type: llm-d with prefill and decode workers needs frontend.epp_config with "
++                    "prefill and decode schedulingProfiles and a disaggregation profile handler"
++                )
++            sidecar_kv_connector(config.backend_for_role("decode"))
++
++    def proxied_worker_modes(self, config: Any) -> frozenset[str]:
++        """Prefill/decode: the router reaches each decode worker through its P/D sidecar."""
++        return frozenset({"decode"}) if _is_pd(config) else frozenset()
++
++    def implied_services(self, config: Any) -> list[EffectiveService]:
++        if not _is_pd(config):
++            return []
++        return [
++            EffectiveService(
++                ServiceConfig(
++                    name=LLM_D_SIDECAR_TYPE,
++                    type=LLM_D_SIDECAR_TYPE,
++                    placement=ServicePlacementConfig(node="decode", per="worker"),
++                    # Nothing on the sidecar's path registers with etcd or NATS.
++                    inherit_discovery_env=False,
++                ),
++                implicit=True,
++                reason="frontend.type llm-d (prefill/decode)",
++            )
++        ]
++
++    def frontend_metrics_port(self, frontend_args: dict[str, Any] | None) -> int | None:
++        """The EPP serves Prometheus on its own listener."""
++        return LLM_D_EPP_METRICS_PORT
++
++    def health_expectations(self, config: Any, processes: list[Process] | None) -> tuple[int, int, str]:
++        """One endpoint per routable worker process: its prefill vLLM, its decode sidecar, or its aggregate vLLM."""
++        if processes is None:
++            return super().health_expectations(config, processes)
++        routable = [process for process in processes if process.http_port > 0]
++        prefill = sum(process.endpoint_mode == "prefill" for process in routable)
++        decode = len(routable) - prefill
++        return prefill, decode, f"{len(routable)} llm-d endpoints"
++
++    def probe_ready(
++        self, host: str, port: int, expected_prefill: int, expected_decode: int, config: Any
++    ) -> WorkerHealthResult:
++        """Envoy's admin ``/ready``, then the EPP's count of endpoints whose metrics it scrapes."""
++        envoy = requests.get(f"http://{host}:{LLM_D_ENVOY_ADMIN_PORT}/ready", timeout=5.0)
++        if envoy.status_code != 200:
++            return WorkerHealthResult(ready=False, message=f"Envoy /ready returned HTTP {envoy.status_code}")
++        metrics = requests.get(f"http://{host}:{LLM_D_EPP_METRICS_PORT}/metrics", timeout=5.0)
++        expected = expected_prefill + expected_decode
++        ready = parse_ready_endpoints(metrics.text) if metrics.status_code == 200 else None
++        if ready is None:
++            return WorkerHealthResult(ready=False, message=f"EPP has not published {READY_ENDPOINTS_METRIC} yet")
++        return WorkerHealthResult(
++            ready=ready >= expected,
++            message=f"llm-d EPP reports {ready}/{expected} endpoints ready",
++            decode_ready=ready,
++            decode_expected=expected,
++        )
++
++    def endpoints_document(
++        self, backend_processes: list[Process], network_interface: str | None
++    ) -> dict[str, list[dict[str, Any]]]:
++        """The file-discovery endpoints: every routable worker, at its proxy's port when it has one."""
++        endpoints = []
++        for process in backend_processes:
++            if process.http_port <= 0:
++                continue
++            port = process.proxy_port if process.proxy_port is not None else process.http_port
++            endpoints.append(
++                {
++                    "name": f"{process.endpoint_mode}-{process.endpoint_index}-{process.node_rank}",
++                    "namespace": POOL,
++                    "address": self.resolve_worker_host(process.node, network_interface),
++                    "port": str(port),
++                    "labels": {ROLE_LABEL: ROLE_BY_MODE[process.endpoint_mode]},
++                }
++            )
++        return {"endpoints": endpoints}
++
++    def epp_command(self, config: Any, epp_config_path: str) -> list[str]:
++        user_args = self.get_frontend_args_list(config.frontend.args)
++        managed = {str(key).replace("_", "-") for key in (config.frontend.args or {})} & _MANAGED_EPP_FLAGS
++        if managed:
++            raise ValueError(f"frontend.args sets {', '.join(sorted(managed))}, which srtctl manages for llm-d")
++        return [
++            *self.executable,
++            f"--pool-name={POOL}",
++            f"--pool-namespace={POOL}",
++            f"--config-file={epp_config_path}",
++            f"--grpc-port={LLM_D_EPP_GRPC_PORT}",
++            f"--grpc-health-port={LLM_D_EPP_HEALTH_PORT}",
++            f"--metrics-port={LLM_D_EPP_METRICS_PORT}",
++            # Envoy dials the EPP over plaintext HTTP/2 on localhost.
++            "--secure-serving=false",
++            *user_args,
++        ]
++
++    def start_frontends(
++        self,
++        topology: Any,
++        runtime: RuntimeContext,
++        config: Any,
++        backend: Any,
++        backend_processes: list[Process],
++        stop_event: threading.Event | None = None,
++    ) -> list[ManagedProcess]:
++        from srtctl.core.processes import FRONTEND_TERMINATE_TIMEOUT_SECONDS, ManagedProcess
++
++        self.wait_for_workers(
++            self.collect_workers(backend, backend_processes, runtime.network_interface), config, stop_event
++        )
++
++        endpoints = self.endpoints_document(backend_processes, runtime.network_interface)
++        (runtime.log_dir / ENDPOINTS_FILE).write_text(yaml.safe_dump(endpoints, sort_keys=False))
++        epp_document = epp_config_document(config.frontend.epp_config, _container_path(ENDPOINTS_FILE))
++        (runtime.log_dir / EPP_CONFIG_FILE).write_text(yaml.safe_dump(epp_document, sort_keys=False))
++        (runtime.log_dir / ENVOY_CONFIG_FILE).write_text(
++            envoy_config(topology.frontend_port, _container_path(ENVOY_ACCESS_LOG))
++        )
++        logger.info("llm-d endpoints (%d): %s", len(endpoints["endpoints"]), endpoints["endpoints"])
++
++        commands = {
++            "epp": self.epp_command(config, _container_path(EPP_CONFIG_FILE)),
++            # One Envoy per step: no hot-restart sockets shared with another Envoy on the host network.
++            "envoy": ["envoy", "-c", _container_path(ENVOY_CONFIG_FILE), "--disable-hot-restart"],
++        }
++        container_image = config.frontend.container_image or str(runtime.container_image)
++        env = {**runtime.environment, **(config.frontend.env or {})}
++        processes: list[ManagedProcess] = []
++        for idx, node in enumerate(topology.frontend_nodes):
++            for component, command in commands.items():
++                cmd = numactl_prefix(config) + command
++                step_name = f"{self.process_name}-{component}_{idx}"
++                log_file = runtime.log_dir / f"{node}_{self.process_name}-{component}_{idx}.out"
++                logger.info("Starting llm-d %s %d on %s: %s", component, idx, node, shlex.join(cmd))
++                proc = self.start_process(
++                    command=cmd,
++                    nodelist=[node],
++                    output=str(log_file),
++                    container_image=container_image,
++                    container_mounts=runtime.container_mounts,
++                    env_to_set=env or None,
++                    het_group=runtime.nodes.het_group_for(node),
++                    step_name=step_name,
++                    srun_options=runtime.srun_options,
++                )
++                processes.append(
++                    ManagedProcess(
++                        name=step_name,
++                        popen=proc,
++                        log_file=log_file,
++                        node=node,
++                        critical=True,
++                        terminate_timeout=FRONTEND_TERMINATE_TIMEOUT_SECONDS,
++                        step_name=step_name,
++                    )
++                )
++        return processes
+diff --git a/src/srtctl/frontends/sglang.py b/src/srtctl/frontends/sglang.py
+index 6c12c4ff..0cabe537 100644
+--- a/src/srtctl/frontends/sglang.py
++++ b/src/srtctl/frontends/sglang.py
+@@ -66,9 +66,6 @@ class SGLangRouterFrontend(StaticRouterFrontend):
+             managed.extend(["--prometheus-host", "0.0.0.0"])
+         return managed
+ 
+-    def worker_scheme(self, backend: Any, mode: str) -> str:
+-        return "grpc" if backend.is_grpc_mode(mode) else "http"
+-
+     def resolve_worker_host(self, node: str, network_interface: str | None) -> str:
+         return get_hostname_ip(node, network_interface)
+ 
+diff --git a/src/srtctl/frontends/sglang_direct.py b/src/srtctl/frontends/sglang_direct.py
+index f996da58..80047fba 100644
+--- a/src/srtctl/frontends/sglang_direct.py
++++ b/src/srtctl/frontends/sglang_direct.py
+@@ -50,6 +50,10 @@ class SGLangFrontend:
+ 
+     metrics_path: ClassVar[str] = "/metrics"
+ 
++    def worker_metrics_path(self, backend: Any) -> str:
++        """The worker is the engine's own server."""
++        return backend.native_metrics_path
++
+     def worker_metrics_port(self, process: Process, runtime: RuntimeContext) -> int | None:
+         """The aggregate leader binds the public port; its followers serve nothing."""
+         if process.endpoint_mode == "agg" and process.is_leader:
+@@ -118,6 +122,10 @@ class SGLangFrontend:
+     def implied_services(self, config: Any) -> list[EffectiveService]:
+         return []
+ 
++    def proxied_worker_modes(self, config: Any) -> frozenset[str]:
++        """No worker sits behind a proxy."""
++        return frozenset()
++
+     def frontend_metrics_port(self, frontend_args: dict[str, Any] | None) -> int | None:
+         return None
+ 
+diff --git a/src/srtctl/frontends/smg.py b/src/srtctl/frontends/smg.py
+new file mode 100644
+index 00000000..53383559
+--- /dev/null
++++ b/src/srtctl/frontends/smg.py
+@@ -0,0 +1,55 @@
++# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++# SPDX-License-Identifier: Apache-2.0
++
++"""Shepherd Model Gateway router frontend (`frontend.type: smg`).
++
++SMG (https://github.com/smg-project/smg) takes its workers as static URLs on the
++command line (``smg launch --worker-urls ...`` or ``--pd-disaggregation --prefill
++URL [BOOTSTRAP_PORT] --decode URL``), lists them at ``GET /workers`` with
++``stats.{prefill,decode,regular}_count``, and detects each HTTP worker's engine
++itself, so the static-router base covers launch, readiness, and worker shape for
++every backend.
++"""
++
++from typing import TYPE_CHECKING, Any, ClassVar
++
++from srtctl.frontends.base import register_frontend
++from srtctl.frontends.static_router import StaticRouterFrontend, setup_script_preamble
++from srtctl.ports import SMG_METRICS_PORT
++
++if TYPE_CHECKING:
++    from srtctl.core.topology import Process
++
++
++@register_frontend("smg")
++class SMGFrontend(StaticRouterFrontend):
++    """Shepherd Model Gateway in front of any engine's direct HTTP workers."""
++
++    type: ClassVar[str] = "smg"
++    required_backend: ClassVar[str | None] = None
++    executable: ClassVar[tuple[str, ...]] = ("smg", "launch")
++    pd_flag: ClassVar[str] = "--pd-disaggregation"
++    process_name: ClassVar[str] = "smg"
++    # SMG waits at most --worker-startup-timeout-secs (1800 s by default) for a startup
++    # worker to register; a large model can load for longer, so every worker is probed first.
++    wait_for_workers_before_start: ClassVar[bool] = True
++
++    def frontend_metrics_port(self, frontend_args: dict[str, Any] | None) -> int | None:
++        """SMG serves Prometheus on its own listener, not on the routing port."""
++        return SMG_METRICS_PORT
++
++    def build_bash_preamble(self, config: Any) -> str | None:
++        """Run the recipe setup script in SMG's container, e.g. to ``pip install smg``."""
++        return setup_script_preamble(config)
++
++    def get_managed_frontend_args(
++        self,
++        config: Any,
++        backend: Any,
++        backend_processes: "list[Process]",
++    ) -> list[str]:
++        """Bind SMG's Prometheus listener on srtctl's port instead of upstream's default."""
++        normalized = {str(key).replace("_", "-") for key in (config.frontend.args or {})}
++        if "prometheus-port" in normalized:
++            raise ValueError("frontend.args.prometheus-port is managed by srtctl for smg")
++        return ["--prometheus-port", str(SMG_METRICS_PORT)]
+diff --git a/src/srtctl/frontends/static_router.py b/src/srtctl/frontends/static_router.py
+index 8c0ea166..2bd7b605 100644
+--- a/src/srtctl/frontends/static_router.py
++++ b/src/srtctl/frontends/static_router.py
+@@ -8,14 +8,17 @@ from __future__ import annotations
+ import logging
+ import shlex
+ import threading
++import time
+ from dataclasses import dataclass
+ from typing import TYPE_CHECKING, Any, ClassVar, Literal
++from urllib.parse import urlsplit
+ 
+ from srtctl.core.health import (
+     WorkerHealthResult,
+     check_static_router_health,
+     probe_json_health,
+     wait_for_http_endpoints,
++    wait_for_port,
+ )
+ from srtctl.core.slurm import get_hostname_ip, start_srun_process
+ from srtctl.frontends.base import logical_health_expectations, numactl_prefix
+@@ -38,6 +41,28 @@ class RouterWorker:
+     bootstrap_port: int | None = None
+ 
+ 
++def setup_script_preamble(config: Any) -> str | None:
++    """Shell that runs the recipe's ``setup_script`` in a router's own container.
++
++    A router that ships as a package (``pip install``) rather than in the model
++    image installs itself this way; the script is looked up in ``/configs`` and
++    then ``/configs/patches``, as for the workers.
++    """
++    setup_script = getattr(config, "setup_script", None)
++    if not setup_script:
++        return None
++    script_name = shlex.quote(setup_script)
++    return (
++        f"setup_script={script_name} && "
++        'script_path="/configs/${setup_script}" && '
++        'patch_script_path="/configs/patches/${setup_script}" && '
++        'echo "Running setup script: ${script_path} (fallback ${patch_script_path})" && '
++        'if [ -f "${script_path}" ]; then bash "${script_path}"; '
++        'elif [ -f "${patch_script_path}" ]; then bash "${patch_script_path}"; '
++        'else echo "WARNING: ${script_path} or ${patch_script_path} not found"; fi'
++    )
++
++
+ class StaticRouterFrontend:
+     """Base class for routers whose worker topology is supplied on the CLI.
+ 
+@@ -73,6 +98,10 @@ class StaticRouterFrontend:
+ 
+     metrics_path: ClassVar[str] = "/metrics"
+ 
++    def worker_metrics_path(self, backend: Any) -> str:
++        """A routed worker is the engine's own server."""
++        return backend.native_metrics_path
++
+     def worker_metrics_port(self, process: Process, runtime: RuntimeContext) -> int | None:
+         """A native server's leader rank binds the HTTP server that carries /metrics; followers serve nothing."""
+         if process.is_leader and process.http_port > 0:
+@@ -118,6 +147,10 @@ class StaticRouterFrontend:
+         """A static router needs no discovery plane."""
+         return []
+ 
++    def proxied_worker_modes(self, config: Any) -> frozenset[str]:
++        """No worker sits behind a proxy."""
++        return frozenset()
++
+     def frontend_metrics_port(self, frontend_args: dict[str, Any] | None) -> int | None:
+         """Metrics share the routing port unless the router runs a separate listener."""
+         return None
+@@ -150,8 +183,8 @@ class StaticRouterFrontend:
+         return []
+ 
+     def worker_scheme(self, backend: Any, mode: str) -> str:
+-        """Return the protocol used to reach one worker endpoint."""
+-        return "http"
++        """Return the protocol used to reach one worker endpoint: gRPC when the backend's mode serves it."""
++        return "grpc" if backend.is_grpc_mode(mode) else "http"
+ 
+     def worker_bootstrap_port(self, backend: Any, process: Process) -> int | None:
+         """Return the optional P/D bootstrap port advertised for a worker."""
+@@ -205,6 +238,42 @@ class StaticRouterFrontend:
+         """Return extra direct readiness requirements, if any."""
+         return []
+ 
++    def wait_for_workers(
++        self, workers: list[RouterWorker], config: Any, stop_event: threading.Event | None = None
++    ) -> None:
++        """Block until every advertised worker is healthy, within the recipe's health-check budget.
++
++        HTTP workers must answer ``/health`` with 200; a gRPC worker serves no HTTP
++        ``/health``, so its port accepting connections is the signal. Raises when
++        the budget runs out or ``stop_event`` is set.
++        """
++        if config.health_check is None:
++            return
++        health_check = config.health_check
++        timeout = float(health_check.max_attempts * health_check.interval_seconds)
++        health_urls = [
++            f"{worker.url.rstrip('/')}/health" for worker in workers if worker.url.startswith(("http://", "https://"))
++        ]
++        grpc_targets = [urlsplit(worker.url) for worker in workers if worker.url.startswith("grpc://")]
++        logger.info("Waiting for %d advertised backend endpoints before starting %s", len(workers), self.type)
++        deadline = time.monotonic() + timeout
++        ready = all(
++            wait_for_port(
++                str(target.hostname),
++                int(target.port or 0),
++                timeout=max(deadline - time.monotonic(), 0.0),
++            )
++            for target in grpc_targets
++        ) and wait_for_http_endpoints(
++            health_urls,
++            poll_interval=float(health_check.interval_seconds),
++            timeout=max(deadline - time.monotonic(), 0.0),
++            report_every=60.0,
++            stop_event=stop_event,
++        )
++        if not ready:
++            raise RuntimeError(f"Advertised backend endpoints did not become ready before {self.type} startup")
++
+     def discovers_workers(self, backend: Any) -> bool:
+         """Whether the router learns its workers by registration instead of from its command line.
+ 
+@@ -264,25 +333,8 @@ class StaticRouterFrontend:
+             )
+ 
+         workers = self.collect_workers(backend, backend_processes, runtime.network_interface)
+-        if self.wait_for_workers_before_start and config.health_check is not None:
+-            health_urls = [
+-                f"{worker.url.rstrip('/')}/health"
+-                for worker in workers
+-                if worker.url.startswith(("http://", "https://"))
+-            ]
+-            if health_urls:
+-                logger.info(
+-                    "Waiting for %d advertised backend endpoints before starting %s", len(health_urls), self.type
+-                )
+-                health_check = config.health_check
+-                if not wait_for_http_endpoints(
+-                    health_urls,
+-                    poll_interval=float(health_check.interval_seconds),
+-                    timeout=float(health_check.max_attempts * health_check.interval_seconds),
+-                    report_every=60.0,
+-                    stop_event=stop_event,
+-                ):
+-                    raise RuntimeError(f"Advertised backend endpoints did not become ready before {self.type} startup")
++        if self.wait_for_workers_before_start:
++            self.wait_for_workers(workers, config, stop_event)
+ 
+         processes: list[ManagedProcess] = []
+         for idx, node in enumerate(topology.frontend_nodes):
+diff --git a/src/srtctl/frontends/trtllm_serve.py b/src/srtctl/frontends/trtllm_serve.py
+index b7df9d2c..85480305 100644
+--- a/src/srtctl/frontends/trtllm_serve.py
++++ b/src/srtctl/frontends/trtllm_serve.py
+@@ -58,10 +58,14 @@ class TRTLLMServeFrontend:
+         """The aggregate worker is the endpoint; P/D workers sit behind the disaggregated orchestrator."""
+         return "public" if mode == "agg" else "allocated"
+ 
+-    # trtllm-serve (worker and disaggregated orchestrator alike) serves Prometheus
+-    # text at /prometheus/metrics; GET /metrics on a worker is JSON iteration stats.
++    # The disaggregated orchestrator serves Prometheus text at /prometheus/metrics, as
++    # its trtllm-serve workers do (TRTLLMProtocol.native_metrics_path).
+     metrics_path: ClassVar[str] = "/prometheus/metrics"
+ 
++    def worker_metrics_path(self, backend: Any) -> str:
++        """The workers are the engine's own servers."""
++        return backend.native_metrics_path
++
+     def worker_metrics_port(self, process: "Process", runtime: "RuntimeContext") -> int | None:
+         """P/D leaders serve Prometheus on their OpenAI port; followers bind nothing. Aggregate is out of scope."""
+         if process.endpoint_mode == "agg" or process.http_port <= 0:
+@@ -119,6 +123,10 @@ class TRTLLMServeFrontend:
+     def implied_services(self, config: Any) -> list["EffectiveService"]:
+         return []
+ 
++    def proxied_worker_modes(self, config: Any) -> frozenset[str]:
++        """No worker sits behind a proxy."""
++        return frozenset()
++
+     def frontend_metrics_port(self, frontend_args: dict[str, Any] | None) -> int | None:
+         return None
+ 
+diff --git a/src/srtctl/frontends/vllm.py b/src/srtctl/frontends/vllm.py
+index 0640abef..b65af1fe 100644
+--- a/src/srtctl/frontends/vllm.py
++++ b/src/srtctl/frontends/vllm.py
+@@ -51,6 +51,10 @@ class VLLMFrontend:
+ 
+     metrics_path: ClassVar[str] = "/metrics"
+ 
++    def worker_metrics_path(self, backend: Any) -> str:
++        """The worker is the engine's own server."""
++        return backend.native_metrics_path
++
+     def worker_metrics_port(self, process: Process, runtime: RuntimeContext) -> int | None:
+         """The aggregate leader binds the public port; its followers serve nothing."""
+         if process.endpoint_mode == "agg" and process.is_leader:
+@@ -110,6 +114,10 @@ class VLLMFrontend:
+     def implied_services(self, config: Any) -> list[EffectiveService]:
+         return []
+ 
++    def proxied_worker_modes(self, config: Any) -> frozenset[str]:
++        """No worker sits behind a proxy."""
++        return frozenset()
++
+     def frontend_metrics_port(self, frontend_args: dict[str, Any] | None) -> int | None:
+         return None
+ 
+diff --git a/src/srtctl/frontends/vllm_router.py b/src/srtctl/frontends/vllm_router.py
+index 2a2fad5c..aa2d7cc3 100644
+--- a/src/srtctl/frontends/vllm_router.py
++++ b/src/srtctl/frontends/vllm_router.py
+@@ -5,12 +5,11 @@
+ 
+ from __future__ import annotations
+ 
+-import shlex
+ from typing import TYPE_CHECKING, Any, ClassVar
+ 
+ from srtctl.core.health import WorkerHealthResult, probe_http_ok
+ from srtctl.frontends.base import logical_health_expectations, register_frontend
+-from srtctl.frontends.static_router import RouterWorker, StaticRouterFrontend
++from srtctl.frontends.static_router import RouterWorker, StaticRouterFrontend, setup_script_preamble
+ from srtctl.ports import VLLM_DISCOVERY_PORT
+ 
+ if TYPE_CHECKING:
+@@ -234,19 +233,7 @@ class VLLMRouterFrontend(StaticRouterFrontend):
+ 
+     def build_bash_preamble(self, config: Any) -> str | None:
+         """Run the recipe setup script in the vLLM Router container."""
+-        setup_script = getattr(config, "setup_script", None)
+-        if not setup_script:
+-            return None
+-        script_name = shlex.quote(setup_script)
+-        return (
+-            f"setup_script={script_name} && "
+-            'script_path="/configs/${setup_script}" && '
+-            'patch_script_path="/configs/patches/${setup_script}" && '
+-            'echo "Running setup script: ${script_path} (fallback ${patch_script_path})" && '
+-            'if [ -f "${script_path}" ]; then bash "${script_path}"; '
+-            'elif [ -f "${patch_script_path}" ]; then bash "${patch_script_path}"; '
+-            'else echo "WARNING: ${script_path} or ${patch_script_path} not found"; fi'
+-        )
++        return setup_script_preamble(config)
+ 
+     def get_backend_health_urls(
+         self,
+diff --git a/src/srtctl/mock.py b/src/srtctl/mock.py
+index 74901354..1bcd92a7 100644
+--- a/src/srtctl/mock.py
++++ b/src/srtctl/mock.py
+@@ -298,6 +298,7 @@ def mock_infrastructure(*, options: MockOptions, output_dir: Path):
+         ("srtctl.cli.mixins.benchmark_stage.wait_for_model", _fake_wait_for_model),
+         ("srtctl.core.health.wait_for_http_endpoints", _fake_wait_for_port),
+         ("srtctl.frontends.static_router.wait_for_http_endpoints", _fake_wait_for_port),
++        ("srtctl.frontends.static_router.wait_for_port", _fake_wait_for_port),
+         ("srtctl.cli.mixins.worker_stage.wait_for_health", _fake_wait_for_port),
+         ("srtctl.frontends.trtllm_serve.wait_for_health", _fake_wait_for_port),
+         # Service readiness probes (etcd, NATS, exporters, declared services).
+diff --git a/src/srtctl/ports.py b/src/srtctl/ports.py
+index 3de5f4b0..48b8f612 100644
+--- a/src/srtctl/ports.py
++++ b/src/srtctl/ports.py
+@@ -35,6 +35,21 @@ SGLANG_NCCL_PORT_BASE = 17500
+ # Only started when --prometheus-port is passed, which srtctl does so tachometer can scrape it.
+ SGLANG_ROUTER_METRICS_PORT = 29000
+ 
++# Shepherd Model Gateway (frontend.type: smg) Prometheus listener on each router node,
++# passed as --prometheus-port so srtctl, not upstream's default, owns it.
++SMG_METRICS_PORT = 29000
++
++# llm-d router (frontend.type: llm-d) on each router node: the Endpoint Picker's ext_proc gRPC,
++# gRPC health, and Prometheus listeners (upstream's defaults, passed explicitly so srtctl owns
++# them) and Envoy's admin listener, which serves /ready.
++LLM_D_EPP_GRPC_PORT = 9002
++LLM_D_EPP_HEALTH_PORT = 9003
++LLM_D_EPP_METRICS_PORT = 9090
++LLM_D_ENVOY_ADMIN_PORT = 9901
++# First listener of a per-worker proxy a router sends a worker's traffic through
++# (llm-d's P/D sidecar in front of a decode worker); see PROXY_PORTS.
++WORKER_PROXY_PORT_BASE = 9600
++
+ # TRT-LLM torch.distributed bootstrap, one port per MPI endpoint.
+ TRTLLM_DIST_INIT_PORT_BASE = 29500
+ 
+@@ -113,6 +128,9 @@ DP_RPC_PORTS = PortKind("dp_rpc", VLLM_DATA_PARALLEL_RPC_PORT, per_node=True)
+ # KVBM leader ZMQ pair: pub at the port, ack at the port + 1.
+ KVBM_ZMQ_PORTS = PortKind("kvbm_zmq", KVBM_ZMQ_PORT_BASE, 2)
+ SIDECAR_GRPC_PORTS = PortKind("sidecar_grpc", DYNAMO_SIDECAR_GRPC_PORT)
++# Bound by the proxy in front of a routable worker whose mode the frontend proxies
++# (``Frontend.proxied_worker_modes``), on the worker's node.
++PROXY_PORTS = PortKind("proxy", WORKER_PROXY_PORT_BASE, per_node=True)
+ # Engine-specific: the backend allocates these for its own processes.
+ NCCL_PORTS = PortKind("nccl", SGLANG_NCCL_PORT_BASE)
+ DIST_INIT_PORTS = PortKind("dist_init", SGLANG_DIST_INIT_PORT_BASE, per_node=True)
+diff --git a/src/srtctl/services/__init__.py b/src/srtctl/services/__init__.py
+index 81e22071..5e9c8210 100644
+--- a/src/srtctl/services/__init__.py
++++ b/src/srtctl/services/__init__.py
+@@ -4,7 +4,17 @@
+ """The top-level ``services:`` block: user-declared long-running processes launched next to the job."""
+ 
+ # Import kinds to trigger registration.
+-from srtctl.services import exporters, generic, gms, infra, lmcache_server, mooncake_master, mooncake_store, ray
++from srtctl.services import (
++    exporters,
++    generic,
++    gms,
++    infra,
++    llm_d_sidecar,
++    lmcache_server,
++    mooncake_master,
++    mooncake_store,
++    ray,
++)
+ from srtctl.services.config import (
+     SERVICE_PLACEMENTS,
+     SERVICE_STARTS,
+@@ -42,6 +52,7 @@ __all__ = [
+     "gms",
+     "infra",
+     "list_service_types",
++    "llm_d_sidecar",
+     "lmcache_server",
+     "mooncake_master",
+     "mooncake_store",
+diff --git a/src/srtctl/services/llm_d_sidecar.py b/src/srtctl/services/llm_d_sidecar.py
+new file mode 100644
+index 00000000..694a3836
+--- /dev/null
++++ b/src/srtctl/services/llm_d_sidecar.py
+@@ -0,0 +1,115 @@
++# SPDX-FileCopyrightText: Copyright (c) 2026 SemiAnalysis LLC. All rights reserved.
++# SPDX-License-Identifier: Apache-2.0
++
++"""``type: llm-d-sidecar``: llm-d's P/D sidecar in front of every routable decode worker.
++
++Implied by ``frontend.type: llm-d`` when the job has prefill and decode workers.
++The Endpoint Picker routes a request to a decode endpoint and names the prefill
++worker in the ``x-prefiller-host-port`` header; the sidecar on that decode
++endpoint sends the prefill request first, then hands the returned
++``kv_transfer_params`` to its own vLLM, whose KV connector pulls the cache from
++the prefill worker. The sidecar is what the router addresses for a decode
++worker, so it binds the worker's ``Process.proxy_port`` and proxies everything
++else (``/metrics`` included) to the worker's HTTP port.
++
++Upstream: llm-d-router ``cmd/pd-sidecar`` and ``pkg/sidecar/proxy`` at v0.11.0
++(https://github.com/llm-d/llm-d-router/tree/a5cbe600ebade00cf3e9885beaf2bfacddeabce1/pkg/sidecar/proxy).
++Its ``GET /health`` answers 200 on its own, so it starts before the workers.
++"""
++
++from __future__ import annotations
++
++from typing import TYPE_CHECKING, Any
++
++from marshmallow import ValidationError
++
++from srtctl.services.config import HttpProbe, ServiceReadinessConfig
++from srtctl.services.registry import ServiceKind, ServiceLaunchContext, register_service
++
++if TYPE_CHECKING:
++    from srtctl.core.schema import SrtConfig
++    from srtctl.core.topology import Process
++    from srtctl.services.config import ServiceConfig
++
++LLM_D_SIDECAR_TYPE = "llm-d-sidecar"
++
++# The sidecar's --kv-connector protocol for the vLLM connector class the decode workers run.
++# Upstream's table of protocols: pkg/sidecar/proxy/options.go (supportedKVConnectors).
++SIDECAR_KV_CONNECTORS: dict[str, str] = {
++    "NixlConnector": "nixlv2",
++}
++
++# Argv shown by dry-run, where there is no worker to read the ports from.
++_PREVIEW_PORTS = ["--port=<worker_proxy_port>", "--model-server-port=<worker_http_port>"]
++
++
++def sidecar_kv_connector(backend: Any) -> str:
++    """The ``--kv-connector`` protocol for the decode workers' KV connector; raises ``ValueError`` when unmapped."""
++    from srtctl.backends.vllm import VLLMProtocol
++
++    # The sidecar drives vLLM's KV transfer protocol; another engine's decode has no row.
++    connector = backend.kv_connector_class("decode") if isinstance(backend, VLLMProtocol) else None
++    try:
++        return SIDECAR_KV_CONNECTORS[str(connector)]
++    except KeyError:
++        supported = ", ".join(f"{name} ({protocol})" for name, protocol in SIDECAR_KV_CONNECTORS.items())
++        raise ValueError(
++            f"the llm-d P/D sidecar has no protocol for the {backend.type} decode KV connector {connector!r}; "
++            f"supported (vLLM): {supported}"
++        ) from None
++
++
++@register_service(LLM_D_SIDECAR_TYPE)
++class LLMDSidecarService(ServiceKind):
++    """llm-d P/D sidecar, one per routable decode worker; implied by the llm-d frontend."""
++
++    builds_command = True
++    default_command = ("pd-sidecar",)
++    default_start = "before_workers"
++    default_critical = True
++    default_placement = "decode"
++    default_per = "worker"
++
++    def validate(self, service: ServiceConfig, config: SrtConfig) -> None:
++        from srtctl.frontends import FRONTEND_NONE, get_frontend
++
++        proxied = (
++            frozenset()
++            if config.frontend.type == FRONTEND_NONE
++            else get_frontend(config.frontend.type).proxied_worker_modes(config)
++        )
++        if service.effective_per != "worker" or service.effective_placement not in proxied:
++            raise ValidationError(
++                f"services[{service.name}] (type {LLM_D_SIDECAR_TYPE}) fronts the workers the frontend proxies "
++                f"({', '.join(sorted(proxied)) or 'none for this recipe'}); set placement.node to one of them "
++                "and placement.per: worker"
++            )
++
++    def container_fallback(self, config: SrtConfig) -> str | None:
++        """The router image (``frontend.container_image``), which ships the sidecar next to the EPP."""
++        return config.frontend.container_image
++
++    def attaches_to(self, process: Process) -> bool:
++        return process.proxy_port is not None
++
++    def build_command(self, service: ServiceConfig, ctx: ServiceLaunchContext) -> list[str]:
++        command = list(service.command) if service.command is not None else list(self.default_command)
++        if ctx.process is None or ctx.config is None or ctx.process.proxy_port is None:
++            managed = [*_PREVIEW_PORTS, "--kv-connector=<decode connector>"]
++        else:
++            connector = sidecar_kv_connector(ctx.config.backend_for_role(ctx.process.endpoint_mode))
++            managed = [
++                f"--port={ctx.process.proxy_port}",
++                f"--model-server-port={ctx.process.http_port}",
++                f"--kv-connector={connector}",
++            ]
++        # The router reaches the sidecar over plain HTTP inside the job.
++        return [*command, *managed, "--secure-proxy=false", *service.args]
++
++    def readiness(self, service: ServiceConfig, ctx: ServiceLaunchContext) -> ServiceReadinessConfig | None:
++        if ctx.process is None or ctx.process.proxy_port is None:
++            return None
++        return ServiceReadinessConfig(
++            http=HttpProbe(port=ctx.process.proxy_port, path="/health"),
++            timeout_seconds=self.default_readiness_timeout,
++        )
+diff --git a/src/srtctl/services/registry.py b/src/srtctl/services/registry.py
+index 97e22db2..ace9d272 100644
+--- a/src/srtctl/services/registry.py
++++ b/src/srtctl/services/registry.py
+@@ -105,6 +105,12 @@ class ServiceLaunchContext:
+                     "worker_gpu_count": str(len(self.process.gpu_indices)),
+                 }
+             )
++            # The worker's own HTTP API, and the listener of the proxy in front of it
++            # when the frontend routes through one (Process.proxy_port).
++            if self.process.http_port > 0:
++                values["worker_http_port"] = str(self.process.http_port)
++            if self.process.proxy_port is not None:
++                values["worker_proxy_port"] = str(self.process.proxy_port)
+         return values
+ 
+ 
+@@ -196,6 +202,15 @@ class ServiceKind:
+         also needs the head to report every member before the client starts.
+         """
+ 
++    def attaches_to(self, process: Process) -> bool:
++        """Whether a ``placement.per: worker`` instance of this kind attaches to ``process``.
++
++        Every engine-0 process of the placed roles by default, followers of a
++        multi-node worker included; a proxy that fronts a worker's API attaches
++        only where that API is (``Process.proxy_port``).
++        """
++        return True
++
+     def metrics(self, service: ServiceConfig) -> list[ServiceMetricsConfig]:
+         """The Prometheus endpoints this service serves; empty when it publishes none.
+ 
+diff --git a/src/srtctl/templates/llm-d-envoy.yaml.j2 b/src/srtctl/templates/llm-d-envoy.yaml.j2
+new file mode 100644
+index 00000000..0878190a
+--- /dev/null
++++ b/src/srtctl/templates/llm-d-envoy.yaml.j2
+@@ -0,0 +1,94 @@
++# Envoy in front of the llm-d Endpoint Picker (frontend.type: llm-d), rendered by srtctl.
++# Follows llm-d's no-Kubernetes guide:
++# https://github.com/llm-d/llm-d/blob/7fb84b0adf8e1d41eb2cef105fc1aafaf5a9b64f/guides/no-kubernetes-deployment/router/envoy/envoy.yaml
++# Differences: the admin listener binds every interface so srtctl can probe /ready from the
++# orchestrator, requests carry no timeout (agentic requests stream for minutes), and an access
++# log records the endpoint the EPP picked for every request.
++
++admin:
++  address:
++    socket_address: {address: 0.0.0.0, port_value: {{ admin_port }}}
++
++static_resources:
++  listeners:
++    - name: llm-d
++      address:
++        socket_address: {address: 0.0.0.0, port_value: {{ listen_port }}}
++      filter_chains:
++        - filters:
++            - name: envoy.filters.network.http_connection_manager
++              typed_config:
++                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
++                stat_prefix: llm-d
++                stream_idle_timeout: 0s
++                request_timeout: 0s
++                access_log:
++                  - name: envoy.access_loggers.file
++                    typed_config:
++                      "@type": type.googleapis.com/envoy.extensions.access_loggers.file.v3.FileAccessLog
++                      path: {{ access_log }}
++                      log_format:
++                        text_format_source:
++                          inline_string: "[%START_TIME%] %REQ(:METHOD)% %REQ(:PATH)% status=%RESPONSE_CODE% flags=%RESPONSE_FLAGS% upstream=%UPSTREAM_HOST% prefiller=%REQ(x-prefiller-host-port)% duration=%DURATION%ms\n"
++                route_config:
++                  name: llm-d
++                  virtual_hosts:
++                    - name: llm-d
++                      domains: ["*"]
++                      routes:
++                        - match: {prefix: "/"}
++                          route: {cluster: original_destination_cluster, timeout: 0s}
++                http_filters:
++                  - name: envoy.filters.http.ext_proc
++                    typed_config:
++                      "@type": type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExternalProcessor
++                      grpc_service:
++                        envoy_grpc: {cluster_name: ext_proc}
++                        timeout: 10s
++                      processing_mode:
++                        request_header_mode: SEND
++                        response_header_mode: SEND
++                        request_body_mode: FULL_DUPLEX_STREAMED
++                        response_body_mode: FULL_DUPLEX_STREAMED
++                        request_trailer_mode: SEND
++                        response_trailer_mode: SEND
++                      message_timeout: 1000s
++                  - name: envoy.filters.http.router
++                    typed_config:
++                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
++                      suppress_envoy_headers: true
++
++  clusters:
++    # The worker the EPP picked, named by its x-gateway-destination-endpoint header.
++    - name: original_destination_cluster
++      type: ORIGINAL_DST
++      connect_timeout: 1000s
++      lb_policy: CLUSTER_PROVIDED
++      # Every request holds a connection here and an ext_proc stream to the EPP for its whole
++      # lifetime; Envoy's default of 1024 would cap the client's concurrency.
++      circuit_breakers:
++        thresholds:
++          - {max_connections: 40000, max_pending_requests: 40000, max_requests: 40000}
++      original_dst_lb_config:
++        use_http_header: true
++        http_header_name: x-gateway-destination-endpoint
++
++    - name: ext_proc
++      type: STATIC
++      connect_timeout: 86400s
++      lb_policy: LEAST_REQUEST
++      circuit_breakers:
++        thresholds:
++          - {max_connections: 40000, max_pending_requests: 40000, max_requests: 40000, max_retries: 1024}
++      typed_extension_protocol_options:
++        envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
++          "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
++          explicit_http_config:
++            http2_protocol_options: {}
++      load_assignment:
++        cluster_name: ext_proc
++        endpoints:
++          - lb_endpoints:
++              - endpoint:
++                  address:
++                    socket_address: {address: 127.0.0.1, port_value: {{ epp_port }}}

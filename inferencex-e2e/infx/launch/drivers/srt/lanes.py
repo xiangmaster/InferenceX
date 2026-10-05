@@ -66,7 +66,8 @@ SRT_LANES: dict[tuple[str, LaunchPath], SrtLane] = {
     ),
     ("b300-dsxe", LaunchPath.SRT_MULTI): SrtLane(frameworks=_DYNAMO),
     ("gb200-nv", LaunchPath.SRT_MULTI): SrtLane(
-        frameworks=_DYNAMO,
+        # [DNM] vllm: plain vllm serve workers behind the llm-d router.
+        frameworks=any_of("dynamo-sglang", "dynamo-trt", "dynamo-vllm", "vllm"),
         setup_scripts={"dynamo-sglang": "install-torchao.sh"},
         mounts=(
             *_AGENTIC_CACHES,
