@@ -60,7 +60,6 @@ export FRAMEWORK=dynamo-sglang
 export PRECISION=fp8
 export SPEC_DECODING=none
 export IS_MULTINODE=true
-export DISAGG=true
 export ISL=8192
 export OSL=1024
 export PREFILL_TP=4
@@ -68,8 +67,6 @@ export PREFILL_EP=1
 export PREFILL_NUM_WORKERS=1
 export DECODE_TP=8
 export DECODE_EP=1
-export DECODE_DP_ATTN=true
-export DECODE_ATTN_DP_SIZE=2
 export DECODE_NUM_WORKERS=2
 
 run_eval --framework lm-eval --port 30000
@@ -97,8 +94,6 @@ def test_batched_eval_runs_every_concurrency_and_stages_results(
     assert meta["eval_concs"] == [1, 4, 8]
     assert meta["completed_eval_concs"] == [1, 4, 8]
     assert meta["failed_eval_concs"] == []
-    assert meta["decode_attn_dp_size"] == 2
-    assert meta["num_gpus"] == 20
     assert sorted(path.name for path in tmp_path.glob("results*.json")) == [
         "results_test_conc1.json",
         "results_test_conc4.json",

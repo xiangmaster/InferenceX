@@ -10,7 +10,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from .topology import Parallelism, attention_dp_size
+from .topology import Parallelism
 
 EVAL_RESULT_FORMAT = "inferencex-eval-v1"
 _CONC_SUFFIX_RE = re.compile(r"_conc(\d+)(?:_\d+)?\.json$")
@@ -246,12 +246,7 @@ def eval_topology(meta: dict[str, Any]) -> dict[str, Any]:
             **{
                 name: as_int(meta.get(f"{prefix}{name}", meta.get(name, 1)), 1)
                 for name in ("tp", "pp", "dcp_size", "pcp_size", "ep")
-            },
-            attn_dp_size=attention_dp_size(
-                meta.get(f"{prefix}attn_dp_size"),
-                as_int(meta.get(f"{prefix}tp", meta.get("tp", 1)), 1),
-                as_bool(meta.get(f"{prefix}dp_attention", meta.get("dp_attention"))),
-            ),
+            }
         )
 
     disagg = as_bool(meta["disagg"])

@@ -540,8 +540,6 @@ def multinode_agentic_exp_name(
             tag += f"ep{ep}"
         if dpa:
             tag += "dpa"
-        if worker.get(Fields.ATTN_DP_SIZE.value) is not None:
-            tag += f"adp{worker[Fields.ATTN_DP_SIZE.value]}"
         return tag
 
     return (
@@ -740,7 +738,6 @@ def mark_eval_entries(matrix_values: list[dict]) -> list[dict]:
             entry[Fields.SPEC_DECODING.value],
             entry[Fields.DP_ATTN.value],
         )
-        key += (entry.get(Fields.ATTN_DP_SIZE.value),)
         sn_groups[key].append((i, entry))
 
     for entries in sn_groups.values():
@@ -812,7 +809,6 @@ def mark_eval_entries(matrix_values: list[dict]) -> list[dict]:
             entry[Fields.DP_ATTN.value],
             entry[Fields.IMAGE.value],
         )
-        key += (entry.get(Fields.ATTN_DP_SIZE.value),)
         ag_sn_groups[key].append((i, conc_val))
     gsm8k_picks: dict[int, int | None] = {}  # index -> multinode eval conc
     for entries in ag_sn_groups.values():
@@ -1065,11 +1061,6 @@ def _fixed_sequence_entries(
                         Fields.PP.value: benchmark.get(Fields.PP.value, 1),
                         Fields.DCP_SIZE.value: benchmark.get(Fields.DCP_SIZE.value, 1),
                         Fields.PCP_SIZE.value: benchmark.get(Fields.PCP_SIZE.value, 1),
-                        **(
-                            {Fields.ATTN_DP_SIZE.value: benchmark[Fields.ATTN_DP_SIZE.value]}
-                            if benchmark.get(Fields.ATTN_DP_SIZE.value) is not None
-                            else {}
-                        ),
                         Fields.CONC.value: conc,
                         Fields.MAX_MODEL_LEN.value: isl + osl + 256,
                         Fields.EP.value: ep if ep is not None else 1,
@@ -1087,12 +1078,6 @@ def _fixed_sequence_entries(
                 }
             )
             entry.update(component_metadata(benchmark, config))
-            for role in ("prefill", "decode") if is_multinode else ("",):
-                topology = entry[role] if role else entry
-                if topology.get(Fields.ATTN_DP_SIZE.value) is not None:
-                    entry[Fields.EXP_NAME.value] += (
-                        f"_{role}adp{topology[Fields.ATTN_DP_SIZE.value]}"
-                    )
             if is_multinode:
                 add_multinode_node_count(entry, runner_data, benchmark.get(Fields.NUM_NODES.value))
             entries.append(validate_matrix_entry(entry, is_multinode))
@@ -1192,11 +1177,6 @@ def _agentic_entries(
                     Fields.PP.value: pp,
                     Fields.DCP_SIZE.value: dcp_size,
                     Fields.PCP_SIZE.value: pcp_size,
-                    **(
-                        {Fields.ATTN_DP_SIZE.value: benchmark[Fields.ATTN_DP_SIZE.value]}
-                        if benchmark.get(Fields.ATTN_DP_SIZE.value) is not None
-                        else {}
-                    ),
                     Fields.EP.value: ep if ep is not None else 1,
                     Fields.DP_ATTN.value: dp_attn if dp_attn is not None else False,
                     Fields.SPEC_DECODING.value: spec_decoding,
@@ -1210,8 +1190,6 @@ def _agentic_entries(
                 f"{agentic_kv_offload_suffix(kv_offloading, kv_offload_backend)}"
                 + (f"_spec-{spec_decoding}" if spec_decoding != "none" else "")
             )
-            if benchmark.get(Fields.ATTN_DP_SIZE.value) is not None:
-                exp_name += f"_adp{benchmark[Fields.ATTN_DP_SIZE.value]}"
         entry.update(
             {
                 Fields.KV_OFFLOADING.value: kv_offloading,

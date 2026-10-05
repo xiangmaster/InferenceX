@@ -39,7 +39,6 @@ WORKLOAD_ENV = (
     "EVAL_*", "SWEBENCH_*", "AIPERF_*", "AGENTIC_*",
     "MODAL_TOKEN_ID", "MODAL_TOKEN_SECRET",
     "TP", "EP_SIZE", "DP_ATTENTION", "PP_SIZE", "DCP_SIZE", "PCP_SIZE", "CONC",
-    "ATTN_DP_SIZE", "PREFILL_ATTN_DP_SIZE", "DECODE_ATTN_DP_SIZE",
     "IS_AGENTIC", "SCENARIO_TYPE",
     "OPENAI_API_KEY", "REQUIRE_POWER", "ENABLE_AGENTX_POWER", "VLLM_ENGINE_READY_TIMEOUT_S",
     "SGLANG_TORCH_PROFILER_DIR", "VLLM_TORCH_PROFILER_DIR",
@@ -181,9 +180,6 @@ def multinode_arguments(
     ]
     if not preflight:
         arguments.append("--no-preflight")
-    for name in ("ATTN_DP_SIZE", "PREFILL_ATTN_DP_SIZE", "DECODE_ATTN_DP_SIZE"):
-        if run.env.get(name):
-            arguments += ["--set", f"benchmark.env.{name}={json.dumps(run.env[name])}"]
     if run.srt.job_tag is not None:
         isl, osl = request.env.get("ISL", ""), request.env.get("OSL", "")
         workload = "agentic" if request.is_agentic else f"{isl}x{osl}"

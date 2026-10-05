@@ -19,7 +19,7 @@ from .power import (
     POWER_METRIC_SCHEMA_VERSION,
     with_power_metrics,
 )
-from .topology import Parallelism, attention_dp_size, validate_parallelism
+from .topology import Parallelism, validate_parallelism
 
 _BASE_ENV_VARS = (
     "RUNNER_TYPE",
@@ -124,11 +124,6 @@ def build_result(benchmark: Mapping[str, Any], env: Mapping[str, str]) -> dict[s
             dcp_size=int(env.get("PREFILL_DCP_SIZE", "1")),
             pcp_size=int(env.get("PREFILL_PCP_SIZE", "1")),
             ep=int(env["PREFILL_EP"]),
-            attn_dp_size=attention_dp_size(
-                env.get("PREFILL_ATTN_DP_SIZE"),
-                int(env["PREFILL_TP"]),
-                env["PREFILL_DP_ATTN"] == "true",
-            ),
         )
         prefill_dp_attn = env["PREFILL_DP_ATTN"]
         decode_num_workers = int(env["DECODE_NUM_WORKERS"])
@@ -138,11 +133,6 @@ def build_result(benchmark: Mapping[str, Any], env: Mapping[str, str]) -> dict[s
             dcp_size=int(env.get("DECODE_DCP_SIZE", "1")),
             pcp_size=int(env.get("DECODE_PCP_SIZE", "1")),
             ep=int(env["DECODE_EP"]),
-            attn_dp_size=attention_dp_size(
-                env.get("DECODE_ATTN_DP_SIZE"),
-                int(env["DECODE_TP"]),
-                env["DECODE_DP_ATTN"] == "true",
-            ),
         )
         decode_dp_attn = env["DECODE_DP_ATTN"]
         validate_parallelism(prefill, decode)
@@ -192,9 +182,6 @@ def build_result(benchmark: Mapping[str, Any], env: Mapping[str, str]) -> dict[s
             dcp_size=int(env.get("DCP_SIZE", "1")),
             pcp_size=int(env.get("PCP_SIZE", "1")),
             ep=ep_size,
-            attn_dp_size=attention_dp_size(
-                env.get("ATTN_DP_SIZE"), tp_size, dp_attention == "true"
-            ),
         )
         validate_parallelism(parallelism)
         num_gpus = parallelism.gpus_per_worker

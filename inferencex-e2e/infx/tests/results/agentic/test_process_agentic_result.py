@@ -648,14 +648,13 @@ def test_processor_throughput_per_gpu(tmp_path: Path):
     agg = _run_processor(
         result_dir,
         output_dir,
-        env_overrides={"TP": "4", "PP_SIZE": "2", "DCP_SIZE": "2", "PCP_SIZE": "2", "EP_SIZE": "4", "DP_ATTENTION": "true", "ATTN_DP_SIZE": "2"},
+        env_overrides={"TP": "4", "PP_SIZE": "2", "DCP_SIZE": "2", "PCP_SIZE": "2"},
     )
     per_gpu = agg["request_metrics"]["throughput"]["per_gpu"]
     assert agg["pp"] == 2
     assert agg["dcp_size"] == 2
     assert agg["pcp_size"] == 2
     assert agg["num_gpus"] == 16
-    assert agg["attn_dp_size"] == 2
     # 840 input + 275 output tokens over 4.1 seconds on 16 GPUs.
     assert per_gpu["total_tput_tps"] == pytest.approx(16.99695)
     assert per_gpu["input_tput_tps"] == pytest.approx(12.80488)
@@ -767,16 +766,13 @@ def test_multinode_processor_surfaces_heterogeneous_hardware(tmp_path: Path):
             "DECODE_DCP_SIZE": "4",
             "DECODE_PCP_SIZE": "1",
             "DECODE_EP": "8",
-            "DECODE_DP_ATTN": "true",
-            "DECODE_ATTN_DP_SIZE": "2",
+            "DECODE_DP_ATTN": "false",
             "DECODE_HARDWARE": "h100",
         },
     )
 
     assert agg["prefill_hw"] == "b200"
     assert agg["decode_hw"] == "h100"
-    assert agg["decode_attn_dp_size"] == 2
-    assert "prefill_attn_dp_size" not in agg
     assert (
         agg["prefill_pp"],
         agg["prefill_dcp_size"],

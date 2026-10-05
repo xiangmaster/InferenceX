@@ -191,16 +191,6 @@ def valid_multinode_master_config():
 
 class TestWorkerConfig:
 
-    @pytest.mark.parametrize("size,enabled", [(1, False), (2, True), (4, True)])
-    def test_explicit_attention_dp_shares_tp_devices(self, size, enabled):
-        worker = WorkerConfig(**{"num-worker": 1, "tp": 4, "ep": 4, "dp-attn": enabled, "attn-dp-size": size})
-        assert worker.model_dump(by_alias=True)["attn-dp-size"] == size
-
-    @pytest.mark.parametrize("size,enabled", [(0, False), (3, True), (2, False), (1, True)])
-    def test_invalid_attention_dp_is_rejected(self, size, enabled):
-        with pytest.raises(ValidationError):
-            WorkerConfig(**{"num-worker": 1, "tp": 4, "ep": 4, "dp-attn": enabled, "attn-dp-size": size})
-
     @pytest.mark.parametrize("field", ["pp", "dcp-size", "pcp-size"])
     def test_worker_parallelism_fields_must_be_positive(self, field):
         with pytest.raises(ValidationError, match="greater than 0"):

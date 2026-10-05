@@ -2387,16 +2387,12 @@ META
     if [ -n "$disagg_metadata" ]; then
         PYTHONPATH="$INFERENCEX_REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 - "$meta_json" <<'PYMETA'
 import json
-import os
 import sys
 from pathlib import Path
 from infx.results.evals import eval_topology
 
 path = Path(sys.argv[1])
 metadata = json.loads(path.read_text())
-for name in ("ATTN_DP_SIZE", "PREFILL_ATTN_DP_SIZE", "DECODE_ATTN_DP_SIZE"):
-    if os.environ.get(name):
-        metadata[name.lower()] = int(os.environ[name])
 metadata.update(eval_topology(metadata))
 path.write_text(json.dumps(metadata, indent=2) + "\n")
 PYMETA

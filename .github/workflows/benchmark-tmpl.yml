@@ -121,7 +121,6 @@ env:
   PP_SIZE: ${{ fromJSON(inputs.config).pp }}
   DCP_SIZE: ${{ fromJSON(inputs.config).dcp-size }}
   PCP_SIZE: ${{ fromJSON(inputs.config).pcp-size }}
-  ATTN_DP_SIZE: ${{ fromJSON(inputs.config).attn-dp-size }}
   EP_SIZE: ${{ fromJSON(inputs.config).ep }}
   DP_ATTENTION: ${{ inputs.dp-attn }}
   CONC: ${{ fromJSON(inputs.config).conc }}

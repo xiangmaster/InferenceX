@@ -6,7 +6,7 @@ from collections.abc import Iterable, Mapping
 from typing import Any
 
 from infx.results.metadata import parse_component_metadata
-from infx.results.topology import Parallelism, attention_dp_size, validate_parallelism
+from infx.results.topology import Parallelism, validate_parallelism
 
 from .request_metrics import compute_request_metrics
 from .server_metrics import compute_server_metrics
@@ -81,20 +81,12 @@ def _gpu_shape(env: Mapping[str, str]) -> tuple[dict[str, Any], int, int, int, s
             dcp_size=_env_int(env, "DCP_SIZE", 1),
             pcp_size=_env_int(env, "PCP_SIZE", 1),
             ep=ep,
-            attn_dp_size=attention_dp_size(
-                env.get("ATTN_DP_SIZE"), tp, _env_bool(env, "DP_ATTENTION")
-            ),
         )
         validate_parallelism(parallelism, error_type=SystemExit)
         fields = {
             "pp": parallelism.pp,
             "dcp_size": parallelism.dcp_size,
             "pcp_size": parallelism.pcp_size,
-            **(
-                {"attn_dp_size": parallelism.attn_dp_size}
-                if parallelism.attn_dp_size is not None
-                else {}
-            ),
         }
         return fields, parallelism.gpus_per_worker, tp, ep, dp_attention
 
@@ -105,11 +97,6 @@ def _gpu_shape(env: Mapping[str, str]) -> tuple[dict[str, Any], int, int, int, s
         dcp_size=_env_int(env, "PREFILL_DCP_SIZE", 1),
         pcp_size=_env_int(env, "PREFILL_PCP_SIZE", 1),
         ep=_env_int(env, "PREFILL_EP", 1),
-        attn_dp_size=attention_dp_size(
-            env.get("PREFILL_ATTN_DP_SIZE"),
-            _env_int(env, "PREFILL_TP"),
-            _env_bool(env, "PREFILL_DP_ATTN"),
-        ),
     )
     prefill_dp_attention = env.get("PREFILL_DP_ATTN", "false")
     decode_num_workers = _env_int(env, "DECODE_NUM_WORKERS")
@@ -119,11 +106,6 @@ def _gpu_shape(env: Mapping[str, str]) -> tuple[dict[str, Any], int, int, int, s
         dcp_size=_env_int(env, "DECODE_DCP_SIZE", 1),
         pcp_size=_env_int(env, "DECODE_PCP_SIZE", 1),
         ep=_env_int(env, "DECODE_EP", 1),
-        attn_dp_size=attention_dp_size(
-            env.get("DECODE_ATTN_DP_SIZE"),
-            _env_int(env, "DECODE_TP"),
-            _env_bool(env, "DECODE_DP_ATTN"),
-        ),
     )
     decode_dp_attention = env.get("DECODE_DP_ATTN", "false")
     validate_parallelism(prefill, decode, error_type=SystemExit)
