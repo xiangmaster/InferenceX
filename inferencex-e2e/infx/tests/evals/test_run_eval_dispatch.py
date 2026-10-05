@@ -1583,13 +1583,16 @@ def test_summary_preserves_single_node_dp_attention(
 ) -> None:
     meta = _summary_metadata(
         tmp_path, IS_MULTINODE="false", TP="8", EP_SIZE="8",
-        DP_ATTENTION=dp_attention,
+        DP_ATTENTION=dp_attention, DISAGG="false", FRAMEWORK="mori-sglang",
     )
     assert meta["dp_attention"] is expected
     assert meta["prefill_dp_attention"] is expected
     assert meta["decode_dp_attention"] is expected
     assert meta["tp"] == 8
     assert meta["ep"] == 8
+    assert meta["disagg"] is False
+    assert meta["prefill_num_workers"] == 0
+    assert meta["decode_num_workers"] == 0
 
 
 def test_summary_preserves_asymmetric_multinode_dp_attention(tmp_path: Path) -> None:
@@ -1597,12 +1600,16 @@ def test_summary_preserves_asymmetric_multinode_dp_attention(tmp_path: Path) -> 
         tmp_path, IS_MULTINODE="true", DP_ATTENTION="false",
         PREFILL_TP="4", PREFILL_EP="4", DECODE_TP="8", DECODE_EP="8",
         PREFILL_DP_ATTN="true", DECODE_DP_ATTN="false",
+        DISAGG="true", PREFILL_NUM_WORKERS="1", DECODE_NUM_WORKERS="2",
     )
     assert meta["dp_attention"] is True
     assert meta["prefill_dp_attention"] is True
     assert meta["decode_dp_attention"] is False
     assert meta["prefill_tp"] == 4
     assert meta["decode_tp"] == 8
+    assert meta["disagg"] is True
+    assert meta["prefill_num_workers"] == 1
+    assert meta["decode_num_workers"] == 2
 
 
 def test_summary_stages_bfcl_upstream_archive_before_cleanup(tmp_path: Path) -> None:

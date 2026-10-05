@@ -2306,6 +2306,21 @@ _write_lm_eval_meta_json() {
     local decode_ep="${DECODE_EP:-${EP_SIZE:-1}}"
     local decode_num_workers="${DECODE_NUM_WORKERS:-1}"
 
+    # The framework names the serving stack, not whether P/D are separate.
+    # Preserve legacy metadata when the caller does not supply this field.
+    local disagg_metadata=""
+    if [ -n "${DISAGG:-}" ]; then
+        case "$DISAGG" in
+            true|false) ;;
+            *) echo "ERROR: DISAGG must be true or false" >&2; return 1 ;;
+        esac
+        printf -v disagg_metadata '  "disagg": %s,\n' "$DISAGG"
+        if [ "$DISAGG" = "false" ] && [ "$is_multinode_json" = "false" ]; then
+            prefill_num_workers=0
+            decode_num_workers=0
+        fi
+    fi
+
     local dp_json
     dp_json="$(_normalize_bool_json "${DP_ATTENTION:-false}")"
     local prefill_dp_json
@@ -2340,7 +2355,7 @@ _write_lm_eval_meta_json() {
     cat > "${meta_json}" <<META
 {
   "is_multinode": ${is_multinode_json},
-  "framework": "${fw:-unknown}",
+${disagg_metadata}  "framework": "${fw:-unknown}",
   "precision": "${prec:-unknown}",
   "spec_decoding": "${SPEC_DECODING:-}",
   "eval_suite": "${eval_suite}",
@@ -2420,7 +2435,7 @@ append_lm_eval_summary() {
         meta_json="${out_dir}/meta_env.json"
     fi
 
-    _write_lm_eval_meta_json "$meta_json" "$batch_metadata" "$metadata_conc"
+    _write_lm_eval_meta_json "$meta_json" "$batch_metadata" "$metadata_conc" || return $?
 
     if [ -n "$batch_concs" ]; then
         echo "Prepared batched eval artifacts in: $(pwd)"

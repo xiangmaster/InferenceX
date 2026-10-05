@@ -5,7 +5,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/../benchmark_lib.sh" --validation-only
 check_env_vars FRAMEWORK
 
 case "$FRAMEWORK" in
-    sglang-disagg)
+    sglang-disagg|mori-sglang)
         # Native workers inherit these engine/library settings through Slurm.
         check_env_vars IS_AGENTIC MODEL_PREFIX
         export ROCM_PATH=/opt/rocm UCX_HOME=/usr/local/ucx RIXL_HOME=/usr/local/rixl

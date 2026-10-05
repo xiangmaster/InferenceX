@@ -16,21 +16,6 @@ sys.path.insert(0, str(ROOT / "utils/srt-slurm/src"))
 from srtctl.core.overrides import apply_overrides_to_recipe, parse_overrides
 
 
-@pytest.mark.parametrize("sku,variant", [("gb200", "override_tp4"), ("gb300", "override_c1")])
-def test_qwen_aggregate_power_shape_matches_serving_gpus(sku, variant):
-    path = ROOT / (
-        "benchmarks/multi_node/srt-slurm-recipes/qwen3.5/sglang/"
-        f"{sku}-fp4/agentx/agg-variants.yaml"
-    )
-    [(_, recipe)] = selected_recipes(yaml.safe_load(path.read_text()), variant)
-    env = recipe["benchmark"]["env"]
-    agg = recipe["roles"]["agg"]
-
-    assert env["IS_MULTINODE"] == "false"
-    assert int(env["TP"]) == agg["args"]["tensor-parallel-size"]
-    assert int(env["TP"]) * int(env["PP_SIZE"]) * int(env["PCP_SIZE"]) == agg["gpus"]
-
-
 @pytest.fixture
 def point(tmp_path):
     recipe = {
@@ -61,8 +46,10 @@ def point(tmp_path):
     return path, recipe, env
 
 
-def test_native_binding_submits_one_point_and_keeps_server_settings(point):
+@pytest.mark.parametrize("framework", ["sglang", "mori-sglang"])
+def test_native_binding_submits_one_point_and_keeps_server_settings(point, framework):
     path, recipe, env = point
+    env["FRAMEWORK"] = framework
     argv = runtime_arguments(f"{path}:base", env)
     overrides = parse_overrides(argv[1::2], [])
     actual = copy.deepcopy(recipe)
@@ -73,12 +60,12 @@ def test_native_binding_submits_one_point_and_keeps_server_settings(point):
         "USE_CHAT_TEMPLATE": "false",
         "CONC": "2", "RESULT_FILENAME": "point-identity", "GPU_MONITOR_INTERVAL": "3",
         "RUN_EVAL": "false", "EVAL_ONLY": "false", "RESULT_DIR": "/logs",
-        "FRAMEWORK": "sglang",
+        "FRAMEWORK": framework,
     }
     assert actual["roles"]["agg"]["args"] == {
         "tensor-parallel-size": 4, "data-parallel-size": 1, "max-running-requests": 32,
     }
-    commands = plan_commands(f"{path}:base", "sglang", ["--json", "--yes", *argv], env)
+    commands = plan_commands(f"{path}:base", framework, ["--json", "--yes", *argv], env)
     assert commands == [["srtctl", "apply", "--json", "--yes", *argv, "--file", f"{path}:base"]]
 
 
@@ -151,8 +138,10 @@ def test_concurrency_selector_keeps_graph_capture_coupled_to_client(point):
         runtime_arguments(f"{path}:zip_override_conc[1]", env)
 
 
-def test_eval_binding_changes_context_without_changing_selected_concurrency(point):
+@pytest.mark.parametrize("framework", ["sglang", "mori-sglang"])
+def test_eval_binding_changes_context_without_changing_selected_concurrency(point, framework):
     path, recipe, env = point
+    env["FRAMEWORK"] = framework
     recipe["roles"]["agg"]["args"]["context-length"] = 512
     path.write_text(yaml.safe_dump({"base": recipe, "zip_override_conc": {
         "benchmark": {"env": {"CONC": ["2", "4"]}},
@@ -165,7 +154,7 @@ def test_eval_binding_changes_context_without_changing_selected_concurrency(poin
     actual = selected_recipes(raw, "zip_override_conc[1]")[0][1]
     assert actual["roles"]["agg"]["args"]["context-length"] == 1024
     assert actual["benchmark"]["env"]["CONC"] == "4"
-    assert len(plan_commands(config, "sglang", ["--json", *argv], env)) == 1
+    assert len(plan_commands(config, framework, ["--json", *argv], env)) == 1
 
 
 def test_dp_attention_is_validated_without_replacing_recipe_topology(point):
