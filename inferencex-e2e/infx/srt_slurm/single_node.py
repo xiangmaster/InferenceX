@@ -12,6 +12,7 @@ from typing import Any
 
 import yaml
 
+from infx.results.topology import attention_dp_size
 from infx.srt_slurm.synthetic_acceptance import ENGINES, selected_recipes, spec_parameters
 
 SINGLE_NODE_ENGINES = {**ENGINES, "atom": "atom"}
@@ -23,12 +24,29 @@ def parallelism_constraints(
     """Read each engine's native topology fields without translating the recipe."""
     tp, ep = int(environment["TP"]), int(environment["EP_SIZE"])
     dp_attention = environment["DP_ATTENTION"] == "true"
+    explicit_attn_dp = attention_dp_size(environment.get("ATTN_DP_SIZE"), tp, dp_attention)
+    attn_dp_size = explicit_attn_dp or (tp if dp_attention else 1)
+    if engine != "sglang" and attn_dp_size != (tp if dp_attention else 1):
+        raise ValueError("Partial attention DP binding is supported only for SGLang")
     if engine == "sglang":
+        modern_attn_dp = args.get("attn-dp-size")
+        native_attn_dp = (
+            modern_attn_dp if modern_attn_dp is not None else args.get("data-parallel-size", 1)
+        )
         return {
             "tensor-parallel-size": (args["tensor-parallel-size"], tp),
-            "data-parallel-size": (args.get("data-parallel-size", 1), tp if dp_attention else 1),
+            "attention data-parallel-size": (native_attn_dp, attn_dp_size),
+            "replica data parallel size": (
+                args.get("data-parallel-size", 1) if modern_attn_dp is not None else 1,
+                1,
+            ),
             "expert-parallel-size": (args.get("expert-parallel-size", args.get("ep-size", 1)), ep),
-            "DP_ATTENTION": (args.get("enable-dp-attention", False), dp_attention),
+            "DP_ATTENTION": (
+                modern_attn_dp > 1
+                if modern_attn_dp is not None
+                else args.get("enable-dp-attention", False),
+                dp_attention,
+            ),
         }
     if engine == "trtllm":
         return {
@@ -167,6 +185,8 @@ def runtime_arguments(config: str, environment: Mapping[str, str]) -> list[str]:
     ]
     if agentic:
         names += ["MODEL_PREFIX", "PRECISION", "DURATION", "TP", "PP_SIZE", "PCP_SIZE"]
+    if environment.get("ATTN_DP_SIZE"):
+        names.append("ATTN_DP_SIZE")
     for name in names:
         value = environment[name]
         if not value:

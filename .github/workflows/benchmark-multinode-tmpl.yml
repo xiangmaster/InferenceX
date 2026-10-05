@@ -182,6 +182,7 @@ env:
   PREFILL_PP_SIZE: ${{ fromJSON(inputs.config).prefill.pp }}
   PREFILL_DCP_SIZE: ${{ fromJSON(inputs.config).prefill.dcp-size }}
   PREFILL_PCP_SIZE: ${{ fromJSON(inputs.config).prefill.pcp-size }}
+  PREFILL_ATTN_DP_SIZE: ${{ fromJSON(inputs.config).prefill.attn-dp-size }}
   PREFILL_EP: ${{ fromJSON(inputs.config).prefill.ep }}
   PREFILL_DP_ATTN: ${{ fromJSON(inputs.config).prefill.dp-attn }}
 
@@ -190,6 +191,7 @@ env:
   DECODE_PP_SIZE: ${{ fromJSON(inputs.config).decode.pp }}
   DECODE_DCP_SIZE: ${{ fromJSON(inputs.config).decode.dcp-size }}
   DECODE_PCP_SIZE: ${{ fromJSON(inputs.config).decode.pcp-size }}
+  DECODE_ATTN_DP_SIZE: ${{ fromJSON(inputs.config).decode.attn-dp-size }}
   DECODE_EP: ${{ fromJSON(inputs.config).decode.ep }}
   DECODE_DP_ATTN: ${{ fromJSON(inputs.config).decode.dp-attn }}
 

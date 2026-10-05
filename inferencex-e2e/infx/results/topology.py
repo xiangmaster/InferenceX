@@ -15,6 +15,7 @@ class Parallelism:
     dcp_size: int = 1
     pcp_size: int = 1
     ep: int = 1
+    attn_dp_size: int | None = None
 
     @property
     def gpus_per_worker(self) -> int:
@@ -33,6 +34,11 @@ class Parallelism:
             f"{prefix}dcp_size": self.dcp_size,
             f"{prefix}pcp_size": self.pcp_size,
             f"{prefix}ep": self.ep,
+            **(
+                {f"{prefix}attn_dp_size": self.attn_dp_size}
+                if self.attn_dp_size is not None
+                else {}
+            ),
         }
 
 
@@ -50,3 +56,20 @@ def validate_parallelism(
             else "PP_SIZE, DCP_SIZE, and PCP_SIZE"
         )
         raise error_type(f"{dimensions} must be positive integers.")
+    for layout in layouts:
+        if layout.attn_dp_size is not None and (
+            layout.attn_dp_size <= 0 or layout.tp % layout.attn_dp_size != 0
+        ):
+            raise error_type("Attention DP size must be positive and divide TP.")
+
+
+def attention_dp_size(value: str | int | None, tp: int, enabled: bool) -> int | None:
+    """Parse an explicit attention-DP axis without inventing it for legacy results."""
+    if value is None or value == "":
+        return None
+    size = int(value)
+    if size <= 0 or tp % size != 0:
+        raise ValueError("Attention DP size must be positive and divide TP.")
+    if (size > 1) != enabled:
+        raise ValueError("Attention DP size must agree with DP attention enabled state.")
+    return size

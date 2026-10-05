@@ -1218,7 +1218,7 @@ class TestGenerateFullSweepSingleNode:
         explicit_config = copy.deepcopy(sample_single_node_config)
         for seq_config in explicit_config["dsr1-fp8-mi300x-sglang"]["scenarios"]["fixed-seq-len"]:
             for search_entry in seq_config["search-space"]:
-                search_entry.update({"pp": 2, "dcp-size": 2, "pcp-size": 2})
+                search_entry.update({"pp": 2, "dcp-size": 2, "pcp-size": 2, "dp-attn": True, "attn-dp-size": 2})
         explicit_result = generate_full_sweep(
             full_sweep_args_single_node,
             explicit_config,
@@ -1228,6 +1228,7 @@ class TestGenerateFullSweepSingleNode:
             (row["pp"], row["dcp-size"], row["pcp-size"])
             for row in explicit_result
         } == {(2, 2, 2)}
+        assert {row["attn-dp-size"] for row in explicit_result} == {2}
 
     def test_filter_by_model_prefix(self, sample_single_node_config, sample_runner_config, full_sweep_args_single_node):
         full_sweep_args_single_node.model_prefix = ["dsr1"]

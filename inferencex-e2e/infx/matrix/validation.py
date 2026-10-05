@@ -54,6 +54,7 @@ class Fields(Enum):
     CONC_LIST = "conc-list"
     EP = "ep"
     DP_ATTN = "dp-attn"
+    ATTN_DP_SIZE = "attn-dp-size"
 
     # Multinode-specific fields (when MULTINODE = true)
     SPEC_DECODING = "spec-decoding"
@@ -153,6 +154,11 @@ def _validate_tp_context_topology(self: Any) -> Any:
             f"'{Fields.TP.value}' ({self.tp}) must be divisible by "
             f"'{Fields.DCP_SIZE.value}' ({self.dcp_size})"
         )
+    if self.attn_dp_size is not None:
+        if self.tp % self.attn_dp_size != 0:
+            raise ValueError("'attn-dp-size' must divide 'tp'")
+        if (self.attn_dp_size > 1) != bool(self.dp_attn):
+            raise ValueError("'attn-dp-size' must agree with 'dp-attn'")
     return self
 
 
@@ -179,6 +185,9 @@ class SingleNodeMatrixEntry(BaseModel):
     pcp_size: int = Field(alias=Fields.PCP_SIZE.value, gt=0, strict=True)
     ep: int
     dp_attn: bool = Field(alias=Fields.DP_ATTN.value)
+    attn_dp_size: int | None = Field(
+        default=None, alias=Fields.ATTN_DP_SIZE.value, gt=0, strict=True
+    )
     conc: int | list[int]
     max_model_len: int = Field(alias=Fields.MAX_MODEL_LEN.value)
     exp_name: str = Field(alias=Fields.EXP_NAME.value)
@@ -212,6 +221,9 @@ class WorkerConfig(BaseModel):
     ep: int
     dp_attn: bool = Field(alias=Fields.DP_ATTN.value)
     hardware: str | None = Field(default=None, min_length=1)
+    attn_dp_size: int | None = Field(
+        default=None, alias=Fields.ATTN_DP_SIZE.value, gt=0, strict=True
+    )
     additional_settings: list[str] | None = Field(
         default_factory=list, alias=Fields.ADDITIONAL_SETTINGS.value
     )
@@ -234,6 +246,9 @@ class AggregateWorkerConfig(BaseModel):
     ep: int
     dp_attn: bool = Field(alias=Fields.DP_ATTN.value)
     hardware: str | None = Field(default=None, min_length=1)
+    attn_dp_size: int | None = Field(
+        default=None, alias=Fields.ATTN_DP_SIZE.value, gt=0, strict=True
+    )
     additional_settings: list[str] | None = Field(
         default_factory=list, alias=Fields.ADDITIONAL_SETTINGS.value
     )
@@ -323,6 +338,9 @@ class SingleNodeAgenticMatrixEntry(BaseModel):
     dp_attn: bool = Field(alias=Fields.DP_ATTN.value)
     spec_decoding: Literal["mtp", "draft_model", "none"] = Field(
         default="none", alias=Fields.SPEC_DECODING.value
+    )
+    attn_dp_size: int | None = Field(
+        default=None, alias=Fields.ATTN_DP_SIZE.value, gt=0, strict=True
     )
     conc: int
     kv_offloading: Literal["none", "dram"] = Field(alias=Fields.KV_OFFLOADING.value)
@@ -547,6 +565,9 @@ class SingleNodeSearchSpaceEntry(BaseModel):
     )
     dp_attn: bool | None = Field(default=None, alias=Fields.DP_ATTN.value)
     router: ComponentMetadata | None = None
+    attn_dp_size: int | None = Field(
+        default=None, alias=Fields.ATTN_DP_SIZE.value, gt=0, strict=True
+    )
     conc_start: int | None = Field(default=None, alias=Fields.CONC_START.value)
     conc_end: int | None = Field(default=None, alias=Fields.CONC_END.value)
     conc_list: list[int] | None = Field(default=None, alias=Fields.CONC_LIST.value)
@@ -635,6 +656,9 @@ class AgenticCodingSearchSpaceEntry(BaseModel):
     pcp_size: int = Field(default=1, alias=Fields.PCP_SIZE.value, gt=0, strict=True)
     ep: int | None = None
     dp_attn: bool | None = Field(default=None, alias=Fields.DP_ATTN.value)
+    attn_dp_size: int | None = Field(
+        default=None, alias=Fields.ATTN_DP_SIZE.value, gt=0, strict=True
+    )
     spec_decoding: Literal["mtp", "draft_model", "none"] = Field(
         default="none", alias=Fields.SPEC_DECODING.value
     )
@@ -691,6 +715,7 @@ class AgenticCodingSearchSpaceEntry(BaseModel):
             _validate_tp_context_topology(self)
         if has_aggregate_worker or has_complete_multinode:
             explicitly_single_node_fields = {
+                "attn_dp_size",
                 "pp",
                 "dcp_size",
                 "pcp_size",

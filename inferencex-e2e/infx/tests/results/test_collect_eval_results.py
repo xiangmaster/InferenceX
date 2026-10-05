@@ -380,6 +380,8 @@ def test_collect_eval_rows_expands_batched_concurrencies(
         "prefill_pp": 2,
         "prefill_dcp_size": 2,
         "prefill_pcp_size": 2,
+        "prefill_attn_dp_size": 2,
+        "prefill_dp_attention": True,
         "prefill_ep": 1,
         "prefill_num_workers": 1,
         "decode_tp": 8,
@@ -411,6 +413,7 @@ def test_collect_eval_rows_expands_batched_concurrencies(
     assert rows[0]["prefill_pp"] == 2
     assert rows[0]["prefill_dcp_size"] == 2
     assert rows[0]["prefill_pcp_size"] == 2
+    assert rows[0]["prefill_attn_dp_size"] == 2
 
 
 def test_collect_eval_rows_ignores_failed_batch_points(

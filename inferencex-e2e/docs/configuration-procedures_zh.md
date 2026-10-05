@@ -578,6 +578,7 @@ python -m pytest infx/tests/matrix/ -v
 - Schema 使用 `extra='forbid'`；必须精确使用 kebab-case alias。
 - `conc-start` + `conc-end` 与非空 `conc-list` 二选一，绝不能同时使用。值必须为正数，start 不得大于 end。
 - `pp`、`dcp-size` 和 `pcp-size` 是正整数。`dcp-size` 必须整除 `tp`。
+- 可选的 `attn-dp-size` 记录 TP 内部的注意力数据并行度，而非模型副本数。它必须为正整数且整除 `tp`，并且仅在 `dp-attn` 为 true 时大于 1。省略时保留旧版布尔元数据。多节点配置应在各 worker 中设置；此参数不增加 GPU 分配数量。
 - 每个 worker 的 GPU 需求为 `num-worker * tp * pp * pcp-size`；DCP 复用 TP GPU，不增加 allocation 乘数。
 - 单节点拓扑字段位于搜索空间条目；多节点字段分别位于 `prefill` 和 `decode` 下。
 - 异构 `hardware` 必须同时出现在两个 worker block，或两边都不出现。它记录结果元数据，不负责 runner 调度。

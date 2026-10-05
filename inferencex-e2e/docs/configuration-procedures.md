@@ -644,6 +644,7 @@ Enforced details come from [`validation.py`](../infx/matrix/validation.py) and a
 - Schemas use `extra='forbid'`. Use kebab-case aliases exactly.
 - Choose either `conc-start` + `conc-end` **or** non-empty `conc-list`, never both. Values must be positive and start must not exceed end.
 - `pp`, `dcp-size`, and `pcp-size` are positive integers. `dcp-size` must divide `tp`.
+- Optional `attn-dp-size` records attention data parallelism within TP, not model replicas. It must be positive, divide `tp`, and exceed 1 exactly when `dp-attn` is true. Omit it to retain legacy boolean-only metadata. Set it on each worker for multinode configurations; it does not multiply GPU allocation.
 - Per-worker GPU demand is `num-worker * tp * pp * pcp-size`. DCP reuses TP GPUs and does not multiply allocation.
 - Single-node topology fields live in the search-space entry. Multi-node fields live independently under `prefill` and `decode`.
 - Heterogeneous `hardware` must appear on both worker blocks or neither. It records result metadata and does not schedule runners.

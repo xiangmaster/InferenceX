@@ -94,6 +94,26 @@ def test_native_variants_select_only_the_matching_matrix_point(point):
         select_recipe(str(path), {**env, "CONC": "8"})
 
 
+@pytest.mark.parametrize("modern", [False, True])
+def test_partial_attention_dp_binds_native_flags_and_result_metadata(point, modern):
+    path, recipe, env = point
+    args = recipe["roles"]["agg"]["args"]
+    args["expert-parallel-size"] = 4
+    if modern:
+        args["attn-dp-size"] = 2
+    else:
+        args.update({"data-parallel-size": 2, "enable-dp-attention": True})
+    path.write_text(yaml.safe_dump({"base": recipe}))
+    env.update({"EP_SIZE": "4", "DP_ATTENTION": "true", "ATTN_DP_SIZE": "2"})
+    overrides = parse_overrides(runtime_arguments(f"{path}:base", env)[1::2], [])
+    actual = copy.deepcopy(recipe)
+    apply_overrides_to_recipe(actual, overrides)
+    assert actual["roles"]["agg"]["args"] == args
+    assert actual["benchmark"]["env"]["ATTN_DP_SIZE"] == "2"
+    with pytest.raises(ValueError, match="attention data-parallel-size"):
+        runtime_arguments(f"{path}:base", {**env, "ATTN_DP_SIZE": "4"})
+
+
 def test_ambiguous_native_variants_are_rejected(point):
     path, recipe, env = point
     path.write_text(yaml.safe_dump({"base": recipe, "override_first": {}, "override_second": {}}))
