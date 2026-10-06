@@ -30,10 +30,10 @@ index db321a70..716b46a0 100644
  | `num_additional_frontends`  | int  | 9             | Additional routers beyond master    |
 diff --git a/docs/llm-d.md b/docs/llm-d.md
 new file mode 100644
-index 00000000..4d96c81f
+index 00000000..22c07b1f
 --- /dev/null
 +++ b/docs/llm-d.md
-@@ -0,0 +1,162 @@
+@@ -0,0 +1,163 @@
 +# llm-d router
 +
 +`frontend.type: llm-d` routes requests with the [llm-d](https://llm-d.ai) router: the
@@ -124,7 +124,8 @@ index 00000000..4d96c81f
 +  the spelling v0.10 and v0.11 both accept. A recipe that configures discovery itself is
 +  rejected.
 +- `llm-d-envoy.yaml`: the guide's Envoy configuration with the public port, an admin
-+  listener srtctl can reach, no request timeout, and an access log
++  listener srtctl can reach, no request timeout, `/metrics` answered with 404 (routed, it
++  would return a different worker's counters on every scrape), and an access log
 +  (`llm-d-envoy-access.log`) recording, for every request, the endpoint the EPP picked
 +  (`upstream=`) and the prefill worker it named (`prefiller=`).
 +
@@ -2550,16 +2551,16 @@ index 97e22db2..ace9d272 100644
  
 diff --git a/src/srtctl/templates/llm-d-envoy.yaml.j2 b/src/srtctl/templates/llm-d-envoy.yaml.j2
 new file mode 100644
-index 00000000..0878190a
+index 00000000..3ed1bacd
 --- /dev/null
 +++ b/src/srtctl/templates/llm-d-envoy.yaml.j2
-@@ -0,0 +1,94 @@
+@@ -0,0 +1,102 @@
 +# Envoy in front of the llm-d Endpoint Picker (frontend.type: llm-d), rendered by srtctl.
 +# Follows llm-d's no-Kubernetes guide:
 +# https://github.com/llm-d/llm-d/blob/7fb84b0adf8e1d41eb2cef105fc1aafaf5a9b64f/guides/no-kubernetes-deployment/router/envoy/envoy.yaml
 +# Differences: the admin listener binds every interface so srtctl can probe /ready from the
-+# orchestrator, requests carry no timeout (agentic requests stream for minutes), and an access
-+# log records the endpoint the EPP picked for every request.
++# orchestrator, requests carry no timeout (agentic requests stream for minutes), /metrics is not
++# routed, and an access log records the endpoint the EPP picked for every request.
 +
 +admin:
 +  address:
@@ -2592,6 +2593,14 @@ index 00000000..0878190a
 +                    - name: llm-d
 +                      domains: ["*"]
 +                      routes:
++                        # A load-balanced /metrics would be a different worker's counters on every scrape;
++                        # the workers and the EPP serve their own. Answered here, without asking the EPP.
++                        - match: {path: "/metrics"}
++                          direct_response: {status: 404}
++                          typed_per_filter_config:
++                            envoy.filters.http.ext_proc:
++                              "@type": type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExtProcPerRoute
++                              disabled: true
 +                        - match: {prefix: "/"}
 +                          route: {cluster: original_destination_cluster, timeout: 0s}
 +                http_filters:
