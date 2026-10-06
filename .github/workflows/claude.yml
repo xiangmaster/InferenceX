@@ -49,6 +49,7 @@ jobs:
         id: claude
         uses: anthropics/claude-code-action@9171db3e57d6a3140a37ddc2ba92788584e0ead6 # v1.0.234
         env:
+          ANTHROPIC_BASE_URL: https://api.openlux.ai
           # Repository agent credential; the pinned action authorizes the triggering actor.
           GH_TOKEN: ${{ secrets.AGENT_PAT }} # zizmor: ignore[secrets-outside-env]
           # Repository agent credential; the pinned action authorizes the triggering actor.
